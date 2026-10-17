@@ -4,7 +4,7 @@ Memoria de proyecto para agentes de código (Claude Code primero). Objetivo: sus
 
 Motor: **CTHG** (*Causal-Temporal HyperGraph*): un grafo de recuerdos en un archivo binario, con tres ejes.
 
-Estado: `cthg-core` completo y probado (16 tests); CLI con `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list`, `mv` e `import`. Faltan los hooks, `verify` y la medición (ver [Fases](#13-fases)).
+Estado: `cthg-core` completo y probado (18 tests); CLI con `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list`, `mv`, `import` y `hook`. Faltan `verify` y la medición (ver [Fases](#13-fases)).
 
 ---
 
@@ -341,16 +341,17 @@ La skill [skill/SKILL.md](skill/SKILL.md) le dice al agente cuándo hacer cada c
 │  │     ├─ retrieve.rs       canales, semillas, propagación, ranking, presupuesto
 │  │     ├─ learn.rs          aprender, planes, consolidación, feedback, olvido, hebb
 │  │     ├─ import.rs         importar Markdown, deducir rutas y proponer CORE
+│  │     ├─ hook.rs           hooks de Claude Code, deduplicación por sesión
 │  │     ├─ text.rs           tokens es/en, similitud, recortes, tokens aproximados
 │  │     └─ binary.rs         formato .cthg (CRC32, guardado atómico)
 │  └─ cthg-cli/               binario `cthg`
 │     └─ src/main.rs
-├─ hooks/                     settings.example.json + README (fase 4)
+├─ hooks/                     settings.example.json + README
 ├─ skill/SKILL.md             cuándo escribir en la memoria
 └─ docs/formato-cthg.md       especificación byte a byte
 ```
 
-En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`) y, en fase 4, `<repo>/.cthg/sesion/<session_id>.json` para no repetir lo ya inyectado. Si se versiona `.cthg/` o no se decide por proyecto (sección 14).
+En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`) y `<repo>/.cthg/sesion/<session_id>.json` para no repetir lo ya inyectado. Si se versiona `.cthg/` o no se decide por proyecto (sección 14).
 
 ---
 
@@ -366,7 +367,7 @@ En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`) y, e
 | `cthg list [--all]` | ✅ | todos los nodos con χ, flags y rama |
 | `cthg mv <de> <a>` | ✅ | la memoria sigue a un archivo o carpeta movidos |
 | `cthg import <archivo.md> [--yes]` | ✅ | parte el archivo en nodos, deduce rutas existentes y propone cuáles son `CORE` |
-| `cthg hook <evento>` | fase 4 | lee el JSON del hook por stdin, deduplica por sesión |
+| `cthg hook <session-start\|prompt\|read\|edit>` | ✅ | lee el JSON del hook por stdin, deduplica por sesión en `.cthg/sesion/<session_id>.json` |
 | `cthg verify` | fase 5 | recomprueba lo anclado (rutas, símbolos, dependencias, comandos) |
 | `cthg gc`, `cthg view` | fase 7 | archivar lo muerto; visor 3D con X = árbol de carpetas |
 
@@ -378,10 +379,10 @@ En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`) y, e
 |---|---|---|
 | `SessionStart` | `cthg hook session-start` | 0, y un paso de olvido |
 | `UserPromptSubmit` | `cthg hook prompt` | 1 + 3 |
-| `PostToolUse` (`Read`) | `cthg hook read` | 2 |
-| `PostToolUse` (`Edit\|Write`) | `cthg hook edit` | sube la activación de esa zona |
+| `PostToolUse` (`Read`) | `cthg hook read` | 2 (`hookSpecificOutput.additionalContext`) |
+| `PostToolUse` (`Edit\|MultiEdit\|Write`) | `cthg hook edit` | sube la activación de esa zona |
 
-Plantilla y reglas en [hooks/](hooks/README.md). En resumen: nunca bloquear (si falla, código 0 y sin salida), no repetir dentro de una sesión, respetar el presupuesto, y comprobar en la documentación el campo exacto con el que `PostToolUse` añade contexto antes de implementarlo. Se instalan en el `.claude/settings.json` **del proyecto**, no en el global.
+Plantilla y reglas en [hooks/](hooks/README.md). En resumen: nunca bloquear (si falla, código 0 y sin salida), no repetir dentro de una sesión y respetar el presupuesto (500 / 800 / 300 tokens). Se instalan en el `.claude/settings.json` **del proyecto**, no en el global.
 
 Los `CLAUDE.md` anidados por carpeta que Claude Code ya carga son la **línea base** contra la que medir.
 
@@ -417,7 +418,7 @@ Criterio de éxito propuesto: ≥ 70 % menos tokens que el `CLAUDE.md` completo,
 | 1 | `cthg-core` + `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list`, `mv` | ✅ (12 tests) |
 | 2 | `import CLAUDE.md` | ✅ (14 tests) |
 | 3 | Canal espacial completo: símbolos desde los hunks de `git diff`, renombres automáticos (`-M`), ranking de rutas por tamaño del diff | ✅ (16 tests) |
-| 4 | `cthg hook` + deduplicación por sesión + instalar en un proyecto de prueba | pendiente |
+| 4 | `cthg hook` + deduplicación por sesión + instalar en un proyecto de prueba | ✅ (18 tests) |
 | 5 | `verify` (anclar y desanclar contra el repo) | pendiente |
 | 6 | Medición (sección 12) | pendiente |
 | 7 | Ramas fusionadas visibles en el tronco, `gc`, visor 3D | pendiente |

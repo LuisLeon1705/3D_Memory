@@ -8,12 +8,14 @@ use cthg_core::model::*;
 use cthg_core::retrieve::{self, Query};
 use cthg_core::score::{self, certainty_tag, View};
 use cthg_core::spatial::{self, Target};
-use cthg_core::{binary, import, text};
+use cthg_core::{binary, hook, import, text};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const DIR: &str = ".cthg";
 const FILE: &str = "memoria.cthg";
+const SES_DIR: &str = "sesion";
 /// Paths that change a lot and say nothing about the task.
 const NOISE: &[&str] = &["Cargo.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock"];
 const NOISE_DIRS: &[&str] = &["target/", "node_modules/", "dist/", "build/", ".cthg/"];
@@ -32,11 +34,17 @@ const HELP: &str = "cthg — memoria de proyecto (ruta · tiempo · confianza)
   cthg list [--all]
   cthg mv <de> <a>       (la memoria sigue a un archivo o carpeta movidos)
   cthg import <archivo.md> [--yes]
+  cthg hook <session-start|prompt|read|edit>
 
-Pendiente: hook (fase 4), verify (fase 5), gc y view (fase 7).";
+Pendiente: verify (fase 5), gc y view (fase 7).";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("hook") {
+        // Hooks never block or fail out loud: on any error, exit 0 with no output.
+        let _ = run_hook(&args[1..]);
+        return;
+    }
     if let Err(e) = run(&args) {
         eprintln!("cthg: {e}");
         std::process::exit(1);
@@ -89,9 +97,12 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// The nearest folder with `.cthg/`, else the git root, else the current folder.
-fn find_root() -> PathBuf {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+/// The nearest folder with `.cthg/`, else the git root, else the starting folder.
+fn find_root_from(start: Option<&Path>) -> PathBuf {
+    let cwd = start
+        .filter(|p| p.is_dir())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     if let Some(d) = cwd.ancestors().find(|d| d.join(DIR).is_dir()) {
         return d.to_path_buf();
     }
@@ -114,7 +125,10 @@ struct Repo {
 
 impl Repo {
     fn open() -> Self {
-        let root = find_root();
+        Self::open_at(None)
+    }
+    fn open_at(start: Option<&Path>) -> Self {
+        let root = find_root_from(start);
         let file = root.join(DIR).join(FILE);
         Repo { root, file }
     }
@@ -425,11 +439,67 @@ fn run(raw: &[String]) -> Result<(), String> {
                 );
             }
         }
-        "hook" | "verify" | "gc" | "view" => {
+        "verify" | "gc" | "view" => {
             return Err(format!("`{cmd}` aún no está implementado (ver GUIA.md, sección Fases)"));
         }
         "help" | "--help" | "-h" => println!("{HELP}"),
         other => return Err(format!("comando desconocido '{other}'\n\n{HELP}")),
+    }
+    Ok(())
+}
+
+fn run_hook(rest: &[String]) -> Result<(), String> {
+    let event = rest.first().map(String::as_str).unwrap_or("");
+    let mut raw_json = String::new();
+    let _ = std::io::stdin().read_to_string(&mut raw_json);
+    let input = hook::HookInput::parse(&raw_json);
+    let start = (!input.cwd.is_empty()).then(|| Path::new(&input.cwd));
+    let repo = Repo::open_at(start);
+    let mut m = repo.load()?;
+    let ses_dir = repo.root.join(DIR).join(SES_DIR);
+
+    match event {
+        "session-start" => {
+            let mut session = hook::SessionState::new(&input.session_id);
+            let v = view(&repo, &m);
+            let out = hook::handle_session_start(&mut m, &v, &mut session);
+            let _ = session.save(&ses_dir);
+            let _ = repo.save(&m);
+            if !out.is_empty() {
+                println!("{out}");
+            }
+        }
+        "prompt" => {
+            let mut session = hook::SessionState::load(&ses_dir, &input.session_id);
+            let (git_ts, moved) = repo.sync_git_and_targets(&mut m);
+            let v = view(&repo, &m);
+            let out = hook::handle_prompt(&mut m, &v, &mut session, &input.prompt, git_ts);
+            if !out.is_empty() || moved > 0 {
+                let _ = repo.save(&m);
+            }
+            if !out.is_empty() {
+                let _ = session.save(&ses_dir);
+                println!("{out}");
+            }
+        }
+        "read" => {
+            let rel = hook::relativize_path(&repo.root, &input.file_path);
+            let mut session = hook::SessionState::load(&ses_dir, &input.session_id);
+            let v = view(&repo, &m);
+            let out = hook::handle_read(&mut m, &v, &mut session, &rel);
+            if !out.is_empty() {
+                let _ = session.save(&ses_dir);
+                let _ = repo.save(&m);
+                println!("{out}");
+            }
+        }
+        "edit" => {
+            let rel = hook::relativize_path(&repo.root, &input.file_path);
+            if hook::handle_edit(&mut m, &rel) > 0 {
+                let _ = repo.save(&m);
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
