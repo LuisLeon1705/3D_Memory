@@ -8,7 +8,7 @@ use cthg_core::model::*;
 use cthg_core::retrieve::{self, Query};
 use cthg_core::score::{self, certainty_tag, View};
 use cthg_core::spatial::{self, Target};
-use cthg_core::{binary, text};
+use cthg_core::{binary, import, text};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -27,12 +27,13 @@ const HELP: &str = "cthg — memoria de proyecto (ruta · tiempo · confianza)
              [--contradicts N] [--supersedes N] [--origin usuario|agente|repo|importado]
              [--core] [--plan] [--deny]
   cthg confirm <id>      cthg deny <id>
-  cthg core [--budget N]
+  cthg core [<id>...] [--budget N]
   cthg recall [--prompt <texto>] [--path P]... [--git] [--budget N] [--limit N]
   cthg list [--all]
   cthg mv <de> <a>       (la memoria sigue a un archivo o carpeta movidos)
+  cthg import <archivo.md> [--yes]
 
-Pendiente: import (fase 2), hook (fase 4), verify (fase 5), gc y view (fase 7).";
+Pendiente: hook (fase 4), verify (fase 5), gc y view (fase 7).";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -48,7 +49,7 @@ struct Args {
     opts: Vec<(String, Option<String>)>,
 }
 
-const FLAGS: &[&str] = &["core", "plan", "deny", "git", "all"];
+const FLAGS: &[&str] = &["core", "plan", "deny", "git", "all", "yes"];
 
 impl Args {
     fn parse(raw: &[String]) -> Result<Self, String> {
@@ -280,6 +281,21 @@ fn run(raw: &[String]) -> Result<(), String> {
             println!("#{id} χ {before:+.2} → {after:+.2}");
         }
         "core" => {
+            if !a.pos.is_empty() {
+                let mut m = repo.load()?;
+                let mut ids = Vec::new();
+                for raw_id in &a.pos {
+                    ids.push(parse_id(&m, Some(raw_id))?);
+                }
+                for &id in &ids {
+                    m.nodes[id as usize].flags |= flags::CORE;
+                }
+                repo.save(&m)?;
+                for id in ids {
+                    println!("core         #{:<4} {}", id, m.nodes[id as usize].label);
+                }
+                return Ok(());
+            }
             let m = repo.load()?;
             let scores = score::score_all(&m, &view(&repo, &m));
             let budget = a.num("budget")?.unwrap_or(500);
@@ -348,7 +364,64 @@ fn run(raw: &[String]) -> Result<(), String> {
             repo.save(&m)?;
             println!("{moved} recuerdos movidos de {from} a {to}");
         }
-        "import" | "hook" | "verify" | "gc" | "view" => {
+        "import" => {
+            let mut m = repo.load()?;
+            let file_arg = a.pos.first().ok_or("uso: cthg import <archivo.md> [--yes]")?;
+            let arg_path = Path::new(file_arg);
+            let full_path = if arg_path.exists() { arg_path.to_path_buf() } else { repo.root.join(arg_path) };
+            let md = std::fs::read_to_string(&full_path)
+                .map_err(|e| format!("no se pudo leer '{}': {e}", full_path.display()))?;
+            let branch = repo.branch(&m);
+            let commit = repo.commit();
+            let apply_core = a.flag("yes");
+            let report = import::import_markdown(&mut m, &md, &branch, &commit, now(), apply_core, |p| {
+                repo.root.join(p).exists()
+            });
+            repo.save(&m)?;
+            let scores = score::score_all(&m, &view(&repo, &m));
+            for &id in &report.added {
+                let n = &m.nodes[id as usize];
+                let loc = if n.path.is_empty() {
+                    "/".to_string()
+                } else if n.symbol.is_empty() {
+                    n.path.clone()
+                } else {
+                    format!("{}::{}", n.path, n.symbol)
+                };
+                println!(
+                    "importado    #{:<4} χ {:+.2} {:<10} {:<24} {}",
+                    n.id,
+                    scores[id as usize].chi,
+                    n.kind.name(),
+                    loc,
+                    n.label
+                );
+            }
+            println!(
+                "{} recuerdos importados ({} ya existían)",
+                report.added.len(),
+                report.existing.len()
+            );
+            if !report.marked_core.is_empty() {
+                println!("{} marcados como CORE:", report.marked_core.len());
+                for &id in &report.marked_core {
+                    println!("  #{:<4} {}", id, m.nodes[id as usize].label);
+                }
+            }
+            if !report.proposed_core.is_empty() {
+                println!(
+                    "\nPropuesta de CORE ({} reglas sin ruta con prohibiciones u obligaciones generales):",
+                    report.proposed_core.len()
+                );
+                for &id in &report.proposed_core {
+                    println!("  #{:<4} {}", id, m.nodes[id as usize].label);
+                }
+                println!(
+                    "Para confirmarlas como CORE ejecuta:\n  cthg import {file_arg} --yes\no elige cuáles marcar con:\n  cthg core <id>..."
+                );
+            }
+        }
+        "hook" | "verify" | "gc" | "view" => {
             return Err(format!("`{cmd}` aún no está implementado (ver GUIA.md, sección Fases)"));
         }
         "help" | "--help" | "-h" => println!("{HELP}"),

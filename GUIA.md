@@ -4,7 +4,7 @@ Memoria de proyecto para agentes de código (Claude Code primero). Objetivo: sus
 
 Motor: **CTHG** (*Causal-Temporal HyperGraph*): un grafo de recuerdos en un archivo binario, con tres ejes.
 
-Estado: `cthg-core` completo y probado (12 tests); CLI con `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list` y `mv`. Faltan los hooks, `import`, `verify` y la medición (ver [Fases](#13-fases)).
+Estado: `cthg-core` completo y probado (14 tests); CLI con `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list`, `mv` e `import`. Faltan los hooks, `verify` y la medición (ver [Fases](#13-fases)).
 
 ---
 
@@ -340,6 +340,7 @@ La skill [skill/SKILL.md](skill/SKILL.md) le dice al agente cuándo hacer cada c
 │  │     ├─ spatial.rs        eje X: normalizar, antecesores, afinidad, renombres
 │  │     ├─ retrieve.rs       canales, semillas, propagación, ranking, presupuesto
 │  │     ├─ learn.rs          aprender, planes, consolidación, feedback, olvido, hebb
+│  │     ├─ import.rs         importar Markdown, deducir rutas y proponer CORE
 │  │     ├─ text.rs           tokens es/en, similitud, recortes, tokens aproximados
 │  │     └─ binary.rs         formato .cthg (CRC32, guardado atómico)
 │  └─ cthg-cli/               binario `cthg`
@@ -360,11 +361,11 @@ En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`) y, e
 | `cthg init` | ✅ | crea `.cthg/memoria.cthg` en la raíz git; detecta el tronco |
 | `cthg learn <texto> [--kind K] [--path P] [--symbol S] [--cause T] [--cause-id N] [--contradicts N] [--supersedes N] [--origin O] [--core] [--plan] [--deny]` | ✅ | sección 6 |
 | `cthg confirm N` / `cthg deny N` | ✅ | α + 1 / β + 1 (lo anclado no se mueve) |
-| `cthg core [--budget N]` | ✅ | canal 0 |
+| `cthg core [<id>…] [--budget N]` | ✅ | canal 0 (o marca nodos existentes como `CORE`) |
 | `cthg recall [--prompt T] [--path P]… [--git] [--budget N] [--limit N]` | ✅ | canales 1–3 (símbolos de diff: fase 3) |
 | `cthg list [--all]` | ✅ | todos los nodos con χ, flags y rama |
 | `cthg mv <de> <a>` | ✅ | la memoria sigue a un archivo o carpeta movidos |
-| `cthg import CLAUDE.md` | fase 2 | parte el archivo en nodos y propone cuáles son `CORE` |
+| `cthg import <archivo.md> [--yes]` | ✅ | parte el archivo en nodos, deduce rutas existentes y propone cuáles son `CORE` |
 | `cthg hook <evento>` | fase 4 | lee el JSON del hook por stdin, deduplica por sesión |
 | `cthg verify` | fase 5 | recomprueba lo anclado (rutas, símbolos, dependencias, comandos) |
 | `cthg gc`, `cthg view` | fase 7 | archivar lo muerto; visor 3D con X = árbol de carpetas |
@@ -414,7 +415,7 @@ Criterio de éxito propuesto: ≥ 70 % menos tokens que el `CLAUDE.md` completo,
 |---|---|---|
 | 0 | Esta guía | ✅ |
 | 1 | `cthg-core` + `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list`, `mv` | ✅ (12 tests) |
-| 2 | `import CLAUDE.md` | pendiente |
+| 2 | `import CLAUDE.md` | ✅ (14 tests) |
 | 3 | Canal espacial completo: símbolos desde los hunks de `git diff`, renombres automáticos (`-M`), ranking de rutas por tamaño del diff | pendiente |
 | 4 | `cthg hook` + deduplicación por sesión + instalar en un proyecto de prueba | pendiente |
 | 5 | `verify` (anclar y desanclar contra el repo) | pendiente |
