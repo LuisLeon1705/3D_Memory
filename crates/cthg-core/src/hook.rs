@@ -157,7 +157,7 @@ pub fn render_node(m: &Memory, scores: &[Score], n: &Node) -> String {
         }
         s.push(')');
     }
-    s.push_str(&format!(": {}", text::clip(&n.text, 240)));
+    s.push_str(&format!(": {}", text::clip(injected_text(n), 240)));
     let cause = m
         .edges
         .iter()
@@ -169,6 +169,19 @@ pub fn render_node(m: &Memory, scores: &[Score], n: &Node) -> String {
     }
     s
 }
+
+/// What a node shows when injected. Imported text carries its section as `[Sección › Introducción] …`
+/// for matching; injected, the section is kept only for fragments too short to stand alone
+/// ("pasa las dos comprobaciones"), because on every line it costs ~20 % more tokens.
+pub fn injected_text(n: &Node) -> &str {
+    match n.text.strip_prefix('[').and_then(|t| t.split_once("] ")) {
+        Some((_, body)) if body.chars().count() >= SELF_CONTAINED_CHARS => body,
+        _ => &n.text,
+    }
+}
+
+/// Below this length a rule needs its section to be understood.
+const SELF_CONTAINED_CHARS: usize = 40;
 
 /// Formats `ids` grouped by χ certainty band under `heading`.
 pub fn format_bands(heading: &str, m: &Memory, scores: &[Score], ids: &[u32]) -> String {
@@ -492,5 +505,14 @@ mod tests {
         }
         let out = handle_session_start(&mut m, &View::all(), &mut SessionState::new("s"));
         assert!(out.contains("no caben aquí"), "{out}");
+    }
+
+    #[test]
+    fn injected_text_drops_the_section_unless_the_rule_needs_it() {
+        let mut m = Memory::default();
+        let long = learn(&mut m, &Claim::rule("[Reglas del código] Código, identificadores y comentarios en inglés", ""), 1.0)[0].node;
+        let short = learn(&mut m, &Claim::rule("[Cómo trabajar › Al terminar una fase] pasa las dos comprobaciones;", ""), 2.0)[0].node;
+        assert_eq!(injected_text(&m.nodes[long as usize]), "Código, identificadores y comentarios en inglés");
+        assert!(injected_text(&m.nodes[short as usize]).starts_with("[Cómo trabajar › Al terminar una fase]"));
     }
 }

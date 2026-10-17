@@ -4,7 +4,7 @@ Memoria de proyecto para agentes de código (Claude Code primero). Objetivo: sus
 
 Motor: **CTHG** (*Causal-Temporal HyperGraph*): un grafo de recuerdos en un archivo binario, con tres ejes.
 
-Estado: `cthg-core` completo y probado (32 tests); CLI con `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list`, `mv`, `import`, `hook`, `verify` y `eval`. Falta la medición sobre repos reales y la fase 7 (ver [Fases](#13-fases)).
+Estado: `cthg-core` completo y probado (36 tests); CLI con `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list`, `mv`, `import`, `hook`, `verify` y `eval`. Falta la medición sobre repos reales y la fase 7 (ver [Fases](#13-fases)).
 
 ---
 
@@ -407,10 +407,10 @@ En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`), `<r
 | `cthg recall [--prompt T] [--path P]… [--git] [--budget N] [--limit N]` | ✅ | canales 1–3 (rutas, símbolos de `git diff`, renombres `-M`) |
 | `cthg list [--all]` | ✅ | todos los nodos con χ, flags (incluido `obsoleto`) y rama |
 | `cthg mv <de> <a>` | ✅ | la memoria sigue a un archivo o carpeta movidos |
-| `cthg import <archivo.md> [--yes]` | ✅ | parte el archivo en nodos, deduce rutas existentes y propone cuáles son `CORE`; cada nodo guarda su origen en `key` (`CLAUDE.md:L12`) |
+| `cthg import <archivo.md> [--yes]` | ✅ | parte el archivo en nodos y propone un `CORE` ordenado que cabe en 500 tokens (sección 12.6); cada nodo guarda su origen en `key` (`CLAUDE.md:L12`) y su contexto (sección 12.5) |
 | `cthg hook <session-start\|prompt\|read\|edit>` | ✅ | lee el JSON del hook por stdin, deduplica por sesión en `.cthg/sesion/<session_id>.json` |
 | `cthg verify [--run-commands]` | ✅ | sección 7.1 |
-| `cthg eval <carpeta> [--markdown] [--repo DIR] [--file CLAUDE.md]` | ✅ | sección 12 |
+| `cthg eval <carpeta> [--markdown] [--repo DIR] [--file CLAUDE.md] [--core-auto]` | ✅ | sección 12; `--core-auto` ignora los `core:` y usa la propuesta de `import` |
 | `cthg gc`, `cthg view` | fase 7 | archivar lo muerto; visor 3D con X = árbol de carpetas |
 
 ---
@@ -508,6 +508,67 @@ Cómo leerlo:
   - El ahorro (65 %) está limitado por el tamaño: con un `CLAUDE.md` de 491 tokens, el núcleo fijo (~100 tokens) pesa mucho. En un archivo real de miles de tokens el coste del núcleo es el mismo y el ahorro crece; hay que confirmarlo con repos reales.
 - **`anidado ideal` es la línea base a batir**: aquí iguala a `todo` en recall con menos tokens, porque es perfecto por construcción (sabe de antemano qué archivos se tocarán). Lo que 3D-Memory añade sobre él son χ, causas, tiempo y ramas, no recall puro.
 
+### 12.5 Primera prueba real: el `AGENTS.md` de este repo
+
+`eval/3d-memory/` (conjunto de **ajuste**) y `eval/3d-memory-prueba/` (conjunto de **prueba**, escrito antes de tocar el código y no usado para decidir nada). Ambos usan el mismo `AGENTS.md` congelado (36 bloques, 1265 tokens) y el mismo `CORE` de 7 reglas, con 10 casos cada uno sacados de tareas reales de las fases 2–6. Las etiquetas las puso el agente que hizo el trabajo: es una prueba inicial, no una medición independiente.
+
+Importar un archivo real destapó cuatro problemas de `import`, y se corrigieron:
+
+- **A · contexto de sección**: los encabezados `##`/`###` se descartaban, así que «Importar dos veces no duplica nodos» perdía que es de la fase 2 (`cthg import`). Ahora el nodo guarda `[Sección › Introducción] texto`, y eso cuenta para el canal léxico.
+- **B · nombres sueltos**: `binary.rs` no se reconocía como `crates/cthg-core/src/binary.rs`. Ahora un nombre de archivo cuenta si hay exactamente un archivo con ese nombre (`git ls-files`).
+- **C · mencionar no es aplicar**: «actualiza GUIA.md» anclaba la regla a `GUIA.md`, y «Lee primero GUIA.md» también. Un documento (`.md`, `docs/…`) solo ancla si el bloque trata de él («En `README.md` …»); si no, gana la ruta de código o la regla queda sin ruta.
+- **D · introducciones**: «pasa las dos comprobaciones» quedaba huérfana de «Al terminar una fase:». Las sub-viñetas heredan la línea que las introduce (por sangría). También se corrigió que «encargo» contuviera «cargo» y se clasificara como comando.
+
+`todo`, antes → después:
+
+| Conjunto | Tokens | Ahorro | Recall | Críticas perdidas |
+|---|---|---|---|---|
+| ajuste | 432 → 536 | 66 % → 58 % | 73 % → 78 % | 2 → 1 |
+| prueba | 468 → 513 | 63 % → 59 % | 77 % → 79 % | 1 → 1 |
+| ejemplo sintético | 171 → 171 | 65 % → 65 % | 93 % → 93 % | 1 → 1 |
+
+Decisiones tomadas **solo con el conjunto de ajuste**:
+
+- Con el prefijo de sección en cada línea inyectada, `todo` subía a 634 tokens. Ahora el prefijo se usa para buscar, pero al inyectar solo se muestra en fragmentos de menos de 40 caracteres, que sin él no se entienden. `todo` queda en 536.
+- Sin encabezados (solo B + C + D): 441 tokens, 75 % y 2 críticas perdidas. Con encabezados: 536, 78 % y 1. Se quedan, porque el criterio pone las críticas por delante. Cuestan ~20 % más tokens.
+
+Qué enseña:
+
+- **En el conjunto de prueba la mejora es pequeña** (+2 puntos de recall, +10 % de tokens). Los arreglos de `import` eran necesarios, pero no son la palanca principal.
+- **Todos los fallos que quedan son `sin ruta y no CORE`**: «resume antes de escribir código», «imita el estilo», «no reescribas módulos enteros», «las matemáticas están en la guía». Un `AGENTS.md` de *proceso* apenas nombra rutas, así que el canal espacial no tiene dónde agarrarse. Lo que decide es **qué reglas son `CORE`**, y eso lo elige una persona (sección 14).
+- **`anidado ideal` pasa a 100 % de recall, pero ahorra solo un 12 %**: con C, las reglas que solo mencionaban `GUIA.md` quedan sin ruta, y en un esquema por carpetas acaban todas en el archivo raíz. Para este tipo de documento, los `CLAUDE.md` anidados no ahorran casi nada.
+
+### 12.6 Elegir el `CORE` automáticamente
+
+Antes, `import` proponía como `CORE` toda regla sin ruta con una palabra normativa. En este repo eso eran 18 reglas que no cabían en 500 tokens, y `session-start` las recortaba por orden de aparición: 707 tokens, 71 % y **5 críticas perdidas** (conjunto de ajuste).
+
+Ahora la propuesta es una **selección dentro del presupuesto**:
+
+```
+candidata  = sin ruta, no es un plan, su sección no trata de un comando o módulo
+             (encabezado sin `código`) y vincula algo
+puntuación = vínculo (prohibición 2 · obligación 1,5 · otra norma 1) + 1 si el autor la puso en negrita
+coste      = approx_tokens(texto) + 5
+selección  = por puntuación, luego la más barata, luego orden del documento,
+             mientras quepa en 500 − 12 tokens (cabecera) − lo que ya es CORE
+```
+
+- Las reglas de una sección sobre un comando («Fase 4 · `cthg hook`») no son candidatas: las encuentra el canal léxico cuando la tarea nombra ese comando.
+- «tiene que», «hay que», «must» y «have to» cuentan como obligación.
+- Por construcción, `--yes` nunca desborda el núcleo.
+
+Decidido con el conjunto de ajuste (la primera versión restaba 1,5 a esas secciones en vez de excluirlas, y dejaba fuera «tienen que»: 703 tokens, 73 % y 7 críticas perdidas). Comprobado una vez en el de prueba:
+
+| `todo` | CORE humano (7 reglas) | CORE automático (12 reglas) |
+|---|---|---|
+| ajuste | 536 tokens · 78 % · 1 crítica perdida | 696 tokens · 87 % · **0** |
+| prueba | 513 tokens · 79 % · 1 crítica perdida | 662 tokens · 85 % · **0** |
+| ejemplo sintético | 171 tokens · 93 % · 1 | 188 tokens · 97 % · 1 (la de «despliego», sección 14) |
+
+- **El `CORE` automático gana al humano en lo que más importa**: cero críticas perdidas en los dos conjuntos reales y +6 a +9 puntos de recall.
+- **Lo paga en tokens** (+30 %). Con un `AGENTS.md` corto (1265 tokens) y de proceso, el núcleo es casi la mitad de lo que se inyecta, y el ahorro baja al 45–48 %. El criterio de ≥ 70 % de ahorro no es alcanzable con un núcleo de 500 tokens en un archivo de este tamaño; en archivos de varios miles de tokens el núcleo cuesta lo mismo y el ahorro crece. Esto hay que medirlo con un archivo largo.
+- **Los fallos que quedan** son reglas de proceso sin palabra normativa («Cada pieza nueva lleva tests…», «Imita el estilo existente…»): ni ruta ni norma explícita.
+
 ### 12.4 Siguientes mediciones
 
 1. Uno o dos repos reales con un `CLAUDE.md` largo, 15–30 casos de sesiones pasadas, etiquetados a mano.
@@ -534,7 +595,7 @@ Criterio de éxito: ≥ 70 % menos tokens que `completo`, **cero** críticas per
 
 ## 14. Riesgos abiertos
 
-- **Clasificar `CORE`** es el punto único de fallo restante. Mitigación: `import` propone, el usuario confirma, `core`/`list`/`import`/`session-start` avisan si el núcleo no cabe, y la medición lista cada fallo.
+- **Clasificar `CORE`** era el punto único de fallo; con la selección automática (sección 12.6) las críticas perdidas bajan a 0 en los dos conjuntos reales. Queda: reglas de proceso sin palabra normativa, que no son candidatas, y el coste en tokens del núcleo en archivos cortos. Mitigación: `import` propone, el usuario confirma, `core`/`list`/`import`/`session-start` avisan si el núcleo no cabe, y la medición lista cada fallo.
 - **Stemming demasiado ligero**: «despliego» no coincide con «despliegue» ni con «desplegar» (medido en `eval/ejemplo`, caso «desplegar»). Opciones: alias por regla, o un stemmer español algo más fuerte; decidirlo con datos de repos reales.
 - **Reformulaciones que cambian una palabra clave**: «depende del crate tokio» se toma como repetición de «depende del crate serde» (similitud 0,75 ≥ 0,5) y refuerza el recuerdo equivocado; lo mismo pasa con `git status` y `git status && git push`. Pendiente: exigir que las palabras que no comparten no sean nombres propios, identificadores o rutas, o subir el umbral cuando la frase es corta.
 - **Ruido espacial** en árboles sucios. Mitigación: ruido, ranking por tamaño del diff, máximo de rutas, pesos, presupuesto.

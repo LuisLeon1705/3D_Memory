@@ -43,7 +43,7 @@ const HELP: &str = "cthg — memoria de proyecto (ruta · tiempo · confianza)
   cthg import <archivo.md> [--yes]
   cthg hook <session-start|prompt|read|edit>
   cthg verify [--run-commands]
-  cthg eval <carpeta> [--markdown] [--repo DIR] [--file CLAUDE.md]
+  cthg eval <carpeta> [--markdown] [--repo DIR] [--file CLAUDE.md] [--core-auto]
 
 Pendiente: gc y view (fase 7).";
 
@@ -66,7 +66,7 @@ struct Args {
     opts: Vec<(String, Option<String>)>,
 }
 
-const FLAGS: &[&str] = &["core", "plan", "deny", "git", "all", "yes", "unset", "run-commands", "markdown"];
+const FLAGS: &[&str] = &["core", "plan", "deny", "git", "all", "yes", "unset", "run-commands", "markdown", "core-auto"];
 
 impl Args {
     fn parse(raw: &[String]) -> Result<Self, String> {
@@ -247,27 +247,9 @@ fn parse_id(m: &Memory, s: Option<&String>) -> Result<u32, String> {
     m.node(id).map(|_| id).ok_or(format!("no existe el nodo #{id}"))
 }
 
-/// One injected line: `- regla (src/core/collider.rs::fn): texto ← causa`.
+/// One injected line: `- regla (src/core/collider.rs::fn): texto ← causa`, exactly as the hooks print it.
 fn render(m: &Memory, scores: &[score::Score], n: &Node) -> String {
-    let mut s = format!("- #{} {}", n.id, n.kind.name());
-    if !n.path.is_empty() {
-        s.push_str(&format!(" ({}", n.path));
-        if !n.symbol.is_empty() {
-            s.push_str(&format!("::{}", n.symbol));
-        }
-        s.push(')');
-    }
-    s.push_str(&format!(": {}", text::clip(&n.text, 240)));
-    let cause = m
-        .edges
-        .iter()
-        .filter(|e| e.kind == EdgeKind::Causes && e.to == n.id && scores[e.from as usize].visible)
-        .max_by(|a, b| scores[a.from as usize].chi.partial_cmp(&scores[b.from as usize].chi).unwrap())
-        .map(|e| &m.nodes[e.from as usize]);
-    if let Some(c) = cause {
-        s.push_str(&format!(" ← {}", text::clip(&c.label, 80)));
-    }
-    s
+    hook::render_node(m, scores, n)
 }
 
 /// Lines grouped by χ band, most trusted band first.
@@ -489,9 +471,9 @@ fn run(raw: &[String]) -> Result<(), String> {
             let apply_core = a.flag("yes");
             // Each node remembers where it came from (`<archivo>:L<línea>`), so `eval` can refer to it.
             let source = spatial::normalize(file_arg);
-            let report = import::import_markdown_named(&mut m, &source, &md, &branch, &commit, now(), apply_core, |p| {
-                repo.root.join(p).exists()
-            });
+            let files = repo_files(&repo.root);
+            let resolve = |p: &str| resolve_in(&files, &repo.root, p);
+            let report = import::import_markdown_named(&mut m, &source, &md, &branch, &commit, now(), apply_core, resolve);
             repo.save(&m)?;
             let scores = score::score_all(&m, &view(&repo, &m));
             for &id in &report.added {
@@ -581,7 +563,7 @@ fn run(raw: &[String]) -> Result<(), String> {
             }
         }
         "eval" => {
-            let dir = PathBuf::from(a.pos.first().ok_or("uso: cthg eval <carpeta> [--markdown] [--repo DIR] [--file CLAUDE.md]")?);
+            let dir = PathBuf::from(a.pos.first().ok_or("uso: cthg eval <carpeta> [--markdown] [--repo DIR] [--file CLAUDE.md] [--core-auto]")?);
             let name = match a.get("file") {
                 Some(f) => f.to_string(),
                 None => ["CLAUDE.md", "AGENTS.md"]
@@ -599,11 +581,12 @@ fn run(raw: &[String]) -> Result<(), String> {
                 .ok()
                 .map(|t| t.lines().map(spatial::normalize).filter(|p| !p.is_empty() && !p.starts_with('#')).collect());
             let root = a.get("repo").map(PathBuf::from).unwrap_or_else(|| repo.root.clone());
-            let exists = |p: &str| match (&listed, a.get("repo")) {
-                (Some(paths), None) => paths.iter().any(|x| spatial::is_ancestor_or_self(p, x)),
-                _ => root.join(p).exists(),
+            let files = match (listed, a.get("repo")) {
+                (Some(paths), None) => Some(import::RepoFiles::new(paths)),
+                _ => repo_files(&root),
             };
-            let report = eval::run(&name, &md, &file, &exists);
+            let resolve = |p: &str| resolve_in(&files, &root, p);
+            let report = eval::run(&name, &md, &file, &resolve, a.flag("core-auto"));
             let out = eval::render_markdown(&report, &dir.display().to_string());
             print!("{out}");
             if a.flag("markdown") {
@@ -636,6 +619,21 @@ fn run_command(root: &Path, cmd: &str) -> Option<bool> {
         Command::new(parts.next()?).current_dir(root).args(parts).output().ok()?.status
     };
     Some(status.success())
+}
+
+/// The repo's files (tracked, and untracked but not ignored), so `import` can tell which paths
+/// exist and find a bare file name. `None` outside git.
+fn repo_files(root: &Path) -> Option<import::RepoFiles> {
+    let out = git(root, &["ls-files", "--cached", "--others", "--exclude-standard"])?;
+    Some(import::RepoFiles::new(out.lines().map(str::to_string)))
+}
+
+/// With a file list, a bare name can resolve to its one file; without it, only exact paths count.
+fn resolve_in(files: &Option<import::RepoFiles>, root: &Path, p: &str) -> Option<String> {
+    match files {
+        Some(f) => f.resolve(p),
+        None => root.join(p).exists().then(|| p.to_string()),
+    }
 }
 
 /// After `learn --origin repo`: anchored only if the repo really shows it.

@@ -279,9 +279,9 @@ fn line_of(n: &Node) -> Option<usize> {
     n.key.rsplit_once(":L").and_then(|(_, l)| l.parse().ok())
 }
 
-fn import_for(source: &str, markdown: &str, core: Option<&[usize]>, exists: &dyn Fn(&str) -> bool) -> Imported {
+fn import_for(source: &str, markdown: &str, core: Option<&[usize]>, resolve: &dyn Fn(&str) -> Option<String>) -> Imported {
     let mut m = Memory::default();
-    let report = import::import_markdown_named(&mut m, source, markdown, "", "", NOW, core.is_none(), exists);
+    let report = import::import_markdown_named(&mut m, source, markdown, "", "", NOW, core.is_none(), resolve);
     let by_line: BTreeMap<usize, u32> = m.nodes.iter().filter_map(|n| line_of(n).map(|l| (l, n.id))).collect();
     let merged: BTreeMap<usize, u32> = report.merged.iter().copied().collect();
     let mut core_unknown = Vec::new();
@@ -419,11 +419,13 @@ fn evaluate_case(imp: &Imported, case: &Case, items: usize, full_tokens: usize) 
 }
 
 /// Evaluates `markdown` (whose lines `casos.md` refers to) against every labelled case.
-pub fn run(source: &str, markdown: &str, file: &CaseFile, exists: &dyn Fn(&str) -> bool) -> EvalReport {
+/// `resolve` answers which repo path a mention names (see `import::RepoFiles`).
+/// `auto_core` ignores the `core:` lines and uses import's own proposal, to compare the two.
+pub fn run(source: &str, markdown: &str, file: &CaseFile, resolve: &dyn Fn(&str) -> Option<String>, auto_core: bool) -> EvalReport {
     let full_tokens = text::approx_tokens(markdown);
     let mut report = EvalReport {
         source: source.to_string(),
-        core_mode: if file.core.is_some() || file.cases.iter().any(|c| c.core.is_some()) {
+        core_mode: if !auto_core && (file.core.is_some() || file.cases.iter().any(|c| c.core.is_some())) {
             "confirmado en casos.md"
         } else {
             "propuesto por import"
@@ -436,9 +438,9 @@ pub fn run(source: &str, markdown: &str, file: &CaseFile, exists: &dyn Fn(&str) 
             report.unlabelled.push(case.name.clone());
             continue;
         }
-        let core = case.core.clone().or_else(|| file.core.clone());
+        let core = if auto_core { None } else { case.core.clone().or_else(|| file.core.clone()) };
         if !cache.iter().any(|(c, _)| *c == core) {
-            cache.push((core.clone(), import_for(source, markdown, core.as_deref(), exists)));
+            cache.push((core.clone(), import_for(source, markdown, core.as_deref(), resolve)));
         }
         let imp = &cache.iter().find(|(c, _)| *c == core).expect("just inserted").1;
         report.blocks = imp.blocks;
@@ -592,8 +594,8 @@ mod tests {
 - Los botones de `src/ui/` usan el tema oscuro siempre.
 ";
 
-    fn exists(p: &str) -> bool {
-        matches!(p, "src" | "src/core" | "src/core/collider.rs" | "src/ui" | "src/ui/button.rs")
+    fn exists(p: &str) -> Option<String> {
+        matches!(p, "src" | "src/core" | "src/core/collider.rs" | "src/ui" | "src/ui/button.rs").then(|| p.to_string())
     }
 
     #[test]
@@ -625,7 +627,7 @@ mod tests {
              ## caso: colisionador\nprompt: arréglalo\ngit: src/core/collider.rs\nrelevantes: L2!, L3, L4, L5, L6!, L7, L99\n",
         )
         .unwrap();
-        let r = run("CLAUDE.md", MD, &cases, &exists);
+        let r = run("CLAUDE.md", MD, &cases, &exists, false);
         assert_eq!(r.merged, 1, "L7 repeats L5");
         let c = &r.cases[0];
         let get = |cfg: Config| c.outcomes.iter().find(|o| o.config == cfg).unwrap();
@@ -656,7 +658,7 @@ mod tests {
 prompt: ¿qué aspecto tiene la interfaz?
 relevantes: L5
 ").unwrap();
-        let r2 = run("CLAUDE.md", MD, &q, &exists);
+        let r2 = run("CLAUDE.md", MD, &q, &exists, false);
         let todo2 = r2.cases[0].outcomes.iter().find(|o| o.config == Config::Todo).unwrap();
         assert_eq!(reason(todo2, 5), Some(MissReason::NoLexicalMatch));
 
@@ -672,14 +674,14 @@ relevantes: L5
             md.push_str(&format!("- En `src/core/collider.rs` alfa{i} beta{i} gamma{i} delta{i} epsilon{i} zeta{i} theta{i} kappa{i}.\n"));
         }
         let cases = parse_cases("## caso: muchas\ngit: src/core/collider.rs\nrelevantes: L2, L61\n").unwrap();
-        let r = run("CLAUDE.md", &md, &cases, &exists);
+        let r = run("CLAUDE.md", &md, &cases, &exists, false);
         let todo = r.cases[0].outcomes.iter().find(|o| o.config == Config::Todo).unwrap();
         assert!(todo.misses.iter().any(|m| m.reason == MissReason::OverBudget), "{:?}", todo.misses);
 
         // A plan is invisible until it happens: χ = −1.
         let plan_md = "# Plan\n- [ ] Pendiente: migrar `src/core/collider.rs` a f64.\n";
         let cases = parse_cases("## caso: plan\ngit: src/core/collider.rs\nrelevantes: L2\n").unwrap();
-        let r = run("CLAUDE.md", plan_md, &cases, &exists);
+        let r = run("CLAUDE.md", plan_md, &cases, &exists, false);
         let todo = r.cases[0].outcomes.iter().find(|o| o.config == Config::Todo).unwrap();
         assert_eq!(todo.misses[0].reason, MissReason::LowChi);
     }
@@ -687,8 +689,8 @@ relevantes: L5
     #[test]
     fn report_is_deterministic_and_marks_the_criterion() {
         let cases = parse_cases("core: L2\n## caso: a\nprompt: arréglalo\ngit: src/core/collider.rs\nrelevantes: L2!, L3\n## caso: b\nrelevantes:\n").unwrap();
-        let a = render_markdown(&run("CLAUDE.md", MD, &cases, &exists), "prueba");
-        let b = render_markdown(&run("CLAUDE.md", MD, &cases, &exists), "prueba");
+        let a = render_markdown(&run("CLAUDE.md", MD, &cases, &exists, false), "prueba");
+        let b = render_markdown(&run("CLAUDE.md", MD, &cases, &exists, false), "prueba");
         assert_eq!(a, b);
         assert!(a.contains("Sin etiquetar (no cuentan): b"));
         assert!(a.contains("Criterio (`todo`)"));
