@@ -15,6 +15,14 @@
 //!   section is general or about one command/module (those are found lexically instead).
 //!   Nothing becomes `CORE` until confirmed (`--yes` or `cthg core <id>`).
 //! - Idempotent: importing the same file twice does not duplicate nodes or inflate `alpha`.
+//! - Follows edits of the file. A block whose stored text is unchanged keeps its node (its `key`
+//!   follows the line it is on now). A changed block (similarity ≥ 0,65 with a block of the same
+//!   file, or else the one that sat in its place between the same unchanged blocks) gets a new
+//!   node that supersedes the old one: Y only moves forward, so the old text stays as history
+//!   and sinks. A block the file no longer has is marked `STALE`, reversibly, and comes back if
+//!   the block does. Only nodes this file imported are touched: what `learn` wrote is never
+//!   superseded nor marked. Flags are changed only on the trunk, as in `verify`; anchored nodes
+//!   are left to `verify`.
 
 use super::learn;
 use super::model::*;
@@ -46,6 +54,15 @@ pub struct ImportReport {
     pub added: Vec<u32>,
     /// Existing node IDs that matched an imported item (not duplicated).
     pub existing: Vec<u32>,
+    /// `(old, new)`: the block changed, so `new` supersedes `old` (which stays as history).
+    pub updated: Vec<(u32, u32)>,
+    /// Blocks this file wrote before and no longer contains, marked `STALE` now.
+    pub stale: Vec<u32>,
+    /// Blocks no longer in the file but left as they are: anchored (only `verify` moves them) or
+    /// imported on a branch other than the trunk.
+    pub missing: Vec<u32>,
+    /// Blocks back in the file after being `STALE`: the mark is lifted.
+    pub restored: Vec<u32>,
     /// `(line, merged_into_node_id)` for items that `find_existing` merged into another node.
     pub merged: Vec<(usize, u32)>,
     /// Pathless general rules proposed for `CORE` (when `apply_core` is false).
@@ -265,8 +282,8 @@ pub fn import_markdown(
     import_markdown_named(m, "CLAUDE.md", md, branch, commit, now, apply_core, resolve)
 }
 
-/// Imports a Markdown document into `m`, stamping each new node's `key` with `"<source>:L<line>"`.
-/// Re-importing the same file preserves existing `node.key` values.
+/// Imports a Markdown document into `m`, stamping each node's `key` with `"<source>:L<line>"`.
+/// Re-importing an edited file updates what changed and marks what is gone (see the module docs).
 #[allow(clippy::too_many_arguments)]
 pub fn import_markdown_named(
     m: &mut Memory,
@@ -293,66 +310,111 @@ pub fn import_markdown_named(
         select_core(&mut items, BUDGET_CORE.saturating_sub(used));
     }
 
-    for item in items {
-        let item_key = format!("{source}:L{}", item.line);
+    // Flags on existing nodes (`STALE`, moving `CORE`) are shared by every branch: like `verify`,
+    // only the trunk changes them. On another branch an edit still gets its own replacement node.
+    let on_trunk = branch.is_empty();
+    let live = |m: &Memory, id: u32| scores.get(id as usize).is_some_and(|s| s.visible) || m.nodes[id as usize].has(flags::POTENTIAL);
+    let superseded: Vec<bool> = {
+        let mut out = vec![false; m.nodes.len()];
+        for e in m.edges.iter().filter(|e| e.kind == EdgeKind::Supersedes) {
+            if live(m, e.from) {
+                if let Some(s) = out.get_mut(e.to as usize) {
+                    *s = true;
+                }
+            }
+        }
+        out
+    };
+    // The current version of each block this file wrote before (not what learn wrote, not what
+    // an edit already replaced).
+    let prefix = format!("{source}:L");
+    let own: Vec<u32> = m
+        .nodes
+        .iter()
+        .filter(|n| n.origin == Origin::Imported && n.key.starts_with(&prefix))
+        .filter(|n| live(m, n.id) && !superseded[n.id as usize])
+        .map(|n| n.id)
+        .collect();
+    let mut claimed = vec![false; m.nodes.len()];
+
+    // Pass 1: blocks whose stored text is unchanged, wherever they moved to in the file.
+    let mut same: Vec<Option<u32>> = vec![None; items.len()];
+    for (i, item) in items.iter().enumerate() {
+        let stored = stored_text(item);
+        let key = format!("{prefix}{}", item.line);
+        let pick = own
+            .iter()
+            .copied()
+            .filter(|&id| !claimed[id as usize] && m.nodes[id as usize].text == stored)
+            .min_by_key(|&id| m.nodes[id as usize].key != key);
+        if let Some(id) = pick {
+            claimed[id as usize] = true;
+            same[i] = Some(id);
+        }
+    }
+    // Where each block sat before this import, and between which unchanged blocks each new block
+    // sits now: a rewritten block takes the place of the old one even if lines above it moved.
+    let old_line: Vec<usize> = m.nodes.iter().map(|n| line_of_key(&n.key, &prefix).unwrap_or(0)).collect();
+    let mut slots = vec![(0usize, usize::MAX); same.len()];
+    let mut lo = 0;
+    for (i, s) in same.iter().enumerate() {
+        slots[i].0 = lo;
+        if let Some(id) = s {
+            lo = old_line[*id as usize];
+        }
+    }
+    let mut hi = usize::MAX;
+    for (i, s) in same.iter().enumerate().rev() {
+        slots[i].1 = hi;
+        if let Some(id) = s {
+            hi = old_line[*id as usize];
+        }
+    }
+
+    for (i, item) in items.into_iter().enumerate() {
+        let item_key = format!("{prefix}{}", item.line);
         let toks = text::tokens(&item.text);
-        if let Some(id) = find_existing(m, &scores, &toks, &item.path) {
-            if !report.added.contains(&id) && !report.existing.contains(&id) {
-                report.existing.push(id);
+        if let Some(id) = same[i] {
+            let n = &mut m.nodes[id as usize];
+            // The key says where the block is now: lines move when something is added above.
+            n.key = item_key;
+            if n.has(flags::STALE) && on_trunk && (n.path.is_empty() || n.path == item.path) {
+                n.flags &= !flags::STALE;
+                report.restored.push(id);
             }
-            if m.nodes[id as usize].key.is_empty() {
-                m.nodes[id as usize].key = item_key;
-            } else if m.nodes[id as usize].key != item_key {
-                report.merged.push((item.line, id));
+            keep_existing(m, &item, id, apply_core, &mut report);
+            continue;
+        }
+        if let Some(old) = find_edited(m, &own, &claimed, &toks, slots[i], &old_line) {
+            claimed[old as usize] = true;
+            let core = m.nodes[old as usize].has(flags::CORE);
+            let id = add_imported(m, &item, item_key, branch, commit, now, (item.propose_core && apply_core) || core);
+            // Y only moves forward: the old text stays as history and sinks under its replacement.
+            m.upsert_edge(id, old, EdgeKind::Supersedes, 1.0, 1.0);
+            if core && on_trunk {
+                m.nodes[old as usize].flags &= !flags::CORE;
             }
-            if m.nodes[id as usize].path.is_empty() && !item.path.is_empty() {
-                m.nodes[id as usize].path = item.path.clone();
-                m.nodes[id as usize].symbol = item.symbol.clone();
-            }
-            let is_pathless = m.nodes[id as usize].path.is_empty();
-            if item.propose_core && is_pathless && !m.nodes[id as usize].has(flags::CORE) {
+            report.updated.push((old, id));
+            if item.propose_core && !core && item.kind != NodeKind::Plan {
                 if apply_core {
-                    m.nodes[id as usize].flags |= flags::CORE;
-                    if !report.marked_core.contains(&id) {
-                        report.marked_core.push(id);
-                    }
-                } else if !report.proposed_core.contains(&id) {
+                    report.marked_core.push(id);
+                } else {
                     report.proposed_core.push(id);
                 }
             }
             continue;
         }
-
-        let y = learn::next_y(m, now);
-        let (alpha, beta) = Origin::Imported.prior();
-        let mut node_flags = 0u8;
-        if item.kind == NodeKind::Plan {
-            node_flags |= flags::POTENTIAL;
-        } else if item.propose_core && apply_core {
-            node_flags |= flags::CORE;
+        if let Some(id) = find_existing(m, &scores, &superseded, &toks, &item.path) {
+            if m.nodes[id as usize].key.is_empty() {
+                m.nodes[id as usize].key = item_key;
+            } else if m.nodes[id as usize].key != item_key {
+                report.merged.push((item.line, id));
+            }
+            keep_existing(m, &item, id, apply_core, &mut report);
+            continue;
         }
-        let full_text = with_context(&item);
-        let id = m.add_node(Node {
-            id: 0,
-            kind: item.kind,
-            origin: Origin::Imported,
-            flags: node_flags,
-            path: item.path,
-            symbol: item.symbol,
-            branch: branch.to_string(),
-            commit: commit.to_string(),
-            y,
-            alpha,
-            beta,
-            activation: 1.0,
-            recalls: 0,
-            created_session: m.session,
-            key: item_key,
-            label: text::clip(&item.text, 64),
-            // The context travels with the text: it is what the agent reads and what lexical recall matches.
-            text: text::clip(&full_text, 600),
-            aliases: vec![],
-        });
+
+        let id = add_imported(m, &item, item_key, branch, commit, now, item.propose_core && apply_core);
         report.added.push(id);
         if item.propose_core && item.kind != NodeKind::Plan {
             if apply_core {
@@ -362,7 +424,82 @@ pub fn import_markdown_named(
             }
         }
     }
+
+    // What this file wrote before and no longer says: obsolete, reversibly (`STALE`, as in verify).
+    for id in own.into_iter().filter(|&id| !claimed[id as usize]) {
+        let n = &mut m.nodes[id as usize];
+        if n.has(flags::STALE) {
+            continue;
+        }
+        if !on_trunk || n.anchored() {
+            report.missing.push(id);
+            continue;
+        }
+        n.flags |= flags::STALE;
+        // A rule the file dropped is not injected every session any more.
+        n.flags &= !flags::CORE;
+        report.stale.push(id);
+    }
     report
+}
+
+/// An existing node that stands for `item`: fill in what it lacks and handle the `CORE` proposal.
+fn keep_existing(m: &mut Memory, item: &ImportItem, id: u32, apply_core: bool, report: &mut ImportReport) {
+    if !report.existing.contains(&id) && !report.added.contains(&id) {
+        report.existing.push(id);
+    }
+    let n = &mut m.nodes[id as usize];
+    if n.path.is_empty() && !item.path.is_empty() {
+        n.path = item.path.clone();
+        n.symbol = item.symbol.clone();
+    }
+    if item.propose_core && n.path.is_empty() && !n.has(flags::CORE) {
+        if apply_core {
+            n.flags |= flags::CORE;
+            if !report.marked_core.contains(&id) {
+                report.marked_core.push(id);
+            }
+        } else if !report.proposed_core.contains(&id) {
+            report.proposed_core.push(id);
+        }
+    }
+}
+
+fn add_imported(m: &mut Memory, item: &ImportItem, key: String, branch: &str, commit: &str, now: f64, core: bool) -> u32 {
+    let y = learn::next_y(m, now);
+    let (alpha, beta) = Origin::Imported.prior();
+    let mut node_flags = 0u8;
+    if item.kind == NodeKind::Plan {
+        node_flags |= flags::POTENTIAL;
+    } else if core {
+        node_flags |= flags::CORE;
+    }
+    m.add_node(Node {
+        id: 0,
+        kind: item.kind,
+        origin: Origin::Imported,
+        flags: node_flags,
+        path: item.path.clone(),
+        symbol: item.symbol.clone(),
+        branch: branch.to_string(),
+        commit: commit.to_string(),
+        y,
+        alpha,
+        beta,
+        activation: 1.0,
+        recalls: 0,
+        created_session: m.session,
+        key,
+        label: text::clip(&item.text, 64),
+        // The context travels with the text: it is what the agent reads and what lexical recall matches.
+        text: stored_text(item),
+        aliases: vec![],
+    })
+}
+
+/// The text a node keeps for `item`; equal text means the block did not change.
+fn stored_text(item: &ImportItem) -> String {
+    text::clip(&with_context(item), 600)
 }
 
 fn with_context(item: &ImportItem) -> String {
@@ -373,7 +510,33 @@ fn with_context(item: &ImportItem) -> String {
     }
 }
 
-fn find_existing(m: &Memory, scores: &[score::Score], toks: &[String], path: &str) -> Option<u32> {
+/// The block this file wrote before that `toks` is an edit of: the most similar unclaimed one
+/// (≥ 0,65), or else the first one that sat in the same place, strictly between the same
+/// unchanged neighbours (`slot`, in old lines), unless that one was already obsolete.
+fn find_edited(m: &Memory, own: &[u32], claimed: &[bool], toks: &[String], slot: (usize, usize), old_line: &[usize]) -> Option<u32> {
+    let free = || own.iter().copied().filter(|&id| !claimed[id as usize]);
+    free()
+        .map(|id| {
+            let n = &m.nodes[id as usize];
+            (id, text::similarity(toks, &text::tokens(&format!("{} {}", n.label, n.text))))
+        })
+        .filter(|&(_, sim)| sim >= 0.65)
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(id, _)| id)
+        .or_else(|| {
+            free()
+                .filter(|&id| !m.nodes[id as usize].has(flags::STALE))
+                .filter(|&id| (slot.0 + 1..slot.1).contains(&old_line[id as usize]))
+                .min_by_key(|&id| old_line[id as usize])
+        })
+}
+
+/// `CLAUDE.md:L12` → 12, for keys of this source (`prefix` = `"CLAUDE.md:L"`).
+fn line_of_key(key: &str, prefix: &str) -> Option<usize> {
+    key.strip_prefix(prefix)?.parse().ok()
+}
+
+fn find_existing(m: &Memory, scores: &[score::Score], superseded: &[bool], toks: &[String], path: &str) -> Option<u32> {
     m.nodes
         .iter()
         .filter(|n| {
@@ -382,6 +545,8 @@ fn find_existing(m: &Memory, scores: &[score::Score], toks: &[String], path: &st
                 .map(|s| s.visible || n.has(flags::POTENTIAL))
                 .unwrap_or(true)
         })
+        // What an edit replaced is history, not a rule a block can repeat.
+        .filter(|n| !superseded.get(n.id as usize).copied().unwrap_or(false))
         .filter(|n| n.kind.is_statement() && paths_compatible(&n.path, path))
         .map(|n| {
             let ntoks = text::tokens(&format!("{} {}", n.label, n.text));
@@ -938,6 +1103,144 @@ cargo test
         assert_eq!(n.label, "Importar dos veces no duplica nodos.");
         let r2 = import_markdown_named(&mut m, "A.md", md, "", "", 2.0, false, |p| files.resolve(p));
         assert!(r2.added.is_empty() && r2.merged.is_empty());
+    }
+
+    const PUSH_LINE: &str = "- Nunca hagas push directo a main ni reescribas la historia.\n";
+
+    fn edited_sample() -> String {
+        SAMPLE_MD
+            .replace("comentarios siempre en inglés.", "comentarios siempre en inglés, también en los tests.")
+            .replace(
+                "La ruta `src/fantasma/inexistente.rs` aún no existe en el árbol.",
+                "El despliegue se hace con el script de la carpeta ops.",
+            )
+    }
+
+    #[test]
+    fn editing_a_line_supersedes_the_old_node_and_keeps_it_as_history() {
+        let mut m = Memory::default();
+        import_markdown_named(&mut m, "CLAUDE.md", SAMPLE_MD, "", "", 1000.0, true, repo);
+        let old = m.by_key("CLAUDE.md:L12").unwrap();
+        let retyped = m.by_key("CLAUDE.md:L15").unwrap();
+        let (old_text, old_y) = (m.nodes[old as usize].text.clone(), m.nodes[old as usize].y);
+        assert!(m.nodes[old as usize].has(flags::CORE));
+
+        let r = import_markdown_named(&mut m, "CLAUDE.md", &edited_sample(), "", "", 2000.0, false, repo);
+        assert!(r.added.is_empty() && r.stale.is_empty() && r.merged.is_empty());
+        assert_eq!(r.existing.len(), 5, "the other blocks did not change");
+        assert_eq!(r.updated.len(), 2);
+
+        // Similar wording: a new node supersedes the old one, which is not rewritten nor moved in Y.
+        let (o, new) = r.updated[0];
+        assert_eq!(o, old);
+        assert_eq!(m.nodes[old as usize].text, old_text);
+        assert_eq!(m.nodes[old as usize].y, old_y);
+        assert!(m.nodes[new as usize].y > old_y);
+        assert!(m.nodes[new as usize].text.contains("también en los tests"));
+        assert_eq!(m.nodes[new as usize].key, "CLAUDE.md:L12");
+        assert!(m.find_edge(new, old, EdgeKind::Supersedes).is_some());
+        // The confirmed CORE follows the rule to its new wording.
+        assert!(m.nodes[new as usize].has(flags::CORE) && !m.nodes[old as usize].has(flags::CORE));
+        assert!(!r.proposed_core.contains(&new));
+
+        // Different words on the same line: matched by its key.
+        assert_eq!(r.updated[1].0, retyped);
+
+        // The old one sinks: E = −1, w = 3/7,5 → χ = −0,4 + 0,6·0,54 = −0,08; the new one 0,32.
+        let s = score_all(&m, &View::all());
+        assert!((s[old as usize].chi + 0.077).abs() < 0.01, "{}", s[old as usize].chi);
+        assert!((s[new as usize].chi - 0.323).abs() < 0.01, "{}", s[new as usize].chi);
+    }
+
+    #[test]
+    fn deleting_a_line_marks_it_stale_and_bringing_it_back_restores_it() {
+        let mut m = Memory::default();
+        import_markdown_named(&mut m, "CLAUDE.md", SAMPLE_MD, "", "", 1000.0, true, repo);
+        let gone = m.by_key("CLAUDE.md:L11").unwrap();
+        let below = m.by_key("CLAUDE.md:L12").unwrap();
+        assert!(m.nodes[gone as usize].has(flags::CORE));
+        let without = SAMPLE_MD.replace(PUSH_LINE, "");
+
+        // On another branch the file says it is gone, but trunk flags are not changed.
+        let mut branch = m.clone();
+        let rb = import_markdown_named(&mut branch, "CLAUDE.md", &without, "feature/x", "", 2000.0, false, repo);
+        assert_eq!(rb.missing, vec![gone]);
+        assert!(rb.stale.is_empty() && !branch.nodes[gone as usize].has(flags::STALE));
+
+        let r = import_markdown_named(&mut m, "CLAUDE.md", &without, "", "", 2000.0, false, repo);
+        assert_eq!(r.stale, vec![gone]);
+        assert!(r.added.is_empty() && r.updated.is_empty() && r.missing.is_empty());
+        assert_eq!(m.nodes.len(), 7, "nothing is deleted");
+        assert!(m.nodes[gone as usize].has(flags::STALE));
+        assert!(!m.nodes[gone as usize].has(flags::CORE), "a dropped rule is not injected every session");
+        // The blocks below moved up a line: same nodes, keys follow them.
+        assert_eq!(m.nodes[below as usize].key, "CLAUDE.md:L11");
+        let s = score_all(&m, &View::all());
+        assert!((s[gone as usize].chi + 0.077).abs() < 0.01, "{}", s[gone as usize].chi);
+
+        // The line comes back: the mark is lifted and CORE is proposed again (here, confirmed).
+        let back = import_markdown_named(&mut m, "CLAUDE.md", SAMPLE_MD, "", "", 3000.0, true, repo);
+        assert_eq!(back.restored, vec![gone]);
+        assert!(back.added.is_empty() && back.updated.is_empty() && back.stale.is_empty());
+        assert!(!m.nodes[gone as usize].has(flags::STALE));
+        assert!(back.marked_core.contains(&gone));
+        assert_eq!(m.nodes[gone as usize].key, "CLAUDE.md:L11");
+        assert_eq!(m.nodes[below as usize].key, "CLAUDE.md:L12");
+    }
+
+    #[test]
+    fn reimporting_an_edited_file_changes_nothing_the_second_time() {
+        let mut m = Memory::default();
+        import_markdown_named(&mut m, "CLAUDE.md", SAMPLE_MD, "", "", 1000.0, true, repo);
+        let edited = edited_sample().replace(PUSH_LINE, "");
+        let r1 = import_markdown_named(&mut m, "CLAUDE.md", &edited, "", "", 2000.0, false, repo);
+        assert_eq!((r1.updated.len(), r1.stale.len()), (2, 1));
+        let (nodes, edges) = (m.nodes.len(), m.edges.len());
+        let flags_before: Vec<u8> = m.nodes.iter().map(|n| n.flags).collect();
+        let before = score_all(&m, &View::all());
+
+        let r2 = import_markdown_named(&mut m, "CLAUDE.md", &edited, "", "", 3000.0, false, repo);
+        assert!(r2.added.is_empty() && r2.updated.is_empty() && r2.merged.is_empty());
+        assert!(r2.stale.is_empty() && r2.restored.is_empty() && r2.missing.is_empty());
+        assert_eq!((m.nodes.len(), m.edges.len()), (nodes, edges));
+        assert_eq!(m.nodes.iter().map(|n| n.flags).collect::<Vec<_>>(), flags_before);
+        let after = score_all(&m, &View::all());
+        for i in 0..m.nodes.len() {
+            assert!((before[i].chi - after[i].chi).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn learned_nodes_survive_edits_and_deletions_of_the_file() {
+        let mut m = Memory::default();
+        // The user said the push rule before the file was imported, plus something the file never says.
+        learn::learn(&mut m, &learn::Claim::rule("Nunca hagas push directo a main ni reescribas la historia.", ""), 500.0);
+        learn::learn(&mut m, &learn::Claim::rule("Los tests de integración van en la carpeta tests", ""), 501.0);
+        assert_eq!((m.nodes[0].origin, m.nodes[1].origin), (Origin::User, Origin::User));
+        let r1 = import_markdown_named(&mut m, "CLAUDE.md", SAMPLE_MD, "", "", 1000.0, false, repo);
+        assert!(r1.existing.contains(&0), "the file restates what was learned");
+        // A correction learned on an imported rule.
+        let confirmed = m.by_key("CLAUDE.md:L14").unwrap();
+        assert!(learn::feedback(&mut m, confirmed, 1));
+        let alpha = m.nodes[confirmed as usize].alpha;
+        let before = score_all(&m, &View::all());
+
+        // The file drops the push rule and rewords another one.
+        let edited = edited_sample().replace(PUSH_LINE, "");
+        let r2 = import_markdown_named(&mut m, "CLAUDE.md", &edited, "", "", 2000.0, false, repo);
+        assert_eq!(r2.updated.len(), 2);
+        for id in [0u32, 1] {
+            assert!(!m.nodes[id as usize].has(flags::STALE));
+            assert!(!r2.stale.contains(&id) && !r2.missing.contains(&id));
+            assert!(m.edges.iter().all(|e| e.to != id), "nothing supersedes what was learned");
+        }
+        let after = score_all(&m, &View::all());
+        for id in [0usize, 1, confirmed as usize] {
+            assert!((before[id].chi - after[id].chi).abs() < 1e-6);
+        }
+        // The confirmation stays: the block did not change, so its node did not either.
+        assert!(r2.existing.contains(&confirmed));
+        assert_eq!(m.nodes[confirmed as usize].alpha, alpha);
     }
 
     #[test]

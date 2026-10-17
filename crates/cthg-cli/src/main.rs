@@ -476,7 +476,7 @@ fn run(raw: &[String]) -> Result<(), String> {
             let report = import::import_markdown_named(&mut m, &source, &md, &branch, &commit, now(), apply_core, resolve);
             repo.save(&m)?;
             let scores = score::score_all(&m, &view(&repo, &m));
-            for &id in &report.added {
+            let line = |action: &str, id: u32| {
                 let n = &m.nodes[id as usize];
                 let loc = if n.path.is_empty() {
                     "/".to_string()
@@ -486,17 +486,44 @@ fn run(raw: &[String]) -> Result<(), String> {
                     format!("{}::{}", n.path, n.symbol)
                 };
                 println!(
-                    "importado    #{:<4} χ {:+.2} {:<10} {:<24} {}",
+                    "{action:<12} #{:<4} χ {:+.2} {:<10} {:<24} {}",
                     n.id,
                     scores[id as usize].chi,
                     n.kind.name(),
                     loc,
                     n.label
                 );
+            };
+            for &id in &report.added {
+                line("importado", id);
+            }
+            for &(old, new) in &report.updated {
+                line("actualizado", new);
+                let note = if m.nodes[old as usize].anchored() { " (anclado: sigue en pie hasta que verify le quite el ancla)" } else { "" };
+                println!("{:<12} └ sustituye a #{} (χ {:+.2}){note}", "", old, scores[old as usize].chi);
+            }
+            for &id in &report.stale {
+                line("obsoleto", id);
+            }
+            for &id in &report.restored {
+                line("restaurado", id);
+            }
+            for &id in &report.missing {
+                line("ya no está", id);
+            }
+            if !report.missing.is_empty() {
+                if branch.is_empty() {
+                    println!("  (anclados: solo verify los mueve)");
+                } else {
+                    println!("  (en la rama {branch} no se marcan: se marcan al importar en el tronco)");
+                }
             }
             println!(
-                "{} recuerdos importados ({} ya existían)",
+                "{} nuevos, {} actualizados, {} obsoletos, {} restaurados ({} ya existían)",
                 report.added.len(),
+                report.updated.len(),
+                report.stale.len(),
+                report.restored.len(),
                 report.existing.len()
             );
             if !report.marked_core.is_empty() {

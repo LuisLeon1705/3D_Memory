@@ -4,7 +4,7 @@ Memoria de proyecto para agentes de código (Claude Code primero). Objetivo: sus
 
 Motor: **CTHG** (*Causal-Temporal HyperGraph*): un grafo de recuerdos en un archivo binario, con tres ejes.
 
-Estado: `cthg-core` completo y probado (36 tests); CLI con `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list`, `mv`, `import`, `hook`, `verify` y `eval`. Falta la medición sobre repos reales y la fase 7 (ver [Fases](#13-fases)).
+Estado: `cthg-core` completo y probado (40 tests); CLI con `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list`, `mv`, `import`, `hook`, `verify` y `eval`. Falta la medición sobre repos reales y la fase 7 (ver [Fases](#13-fases)).
 
 ---
 
@@ -361,6 +361,33 @@ Además:
 - Antes de comprobar rutas, sigue los renombres ya confirmados en commits (`git log -M --diff-filter=R`), para no llamar «borrado» a un archivo movido.
 - `learn --origin repo` se comprueba en el acto. Si el repo lo confirma, queda anclado; si lo contradice, pierde el ancla; si no hay nada que comprobar, pasa a ser una afirmación del `usuario`. «Lo dice el repo» deja de ser algo que se pueda afirmar sin prueba.
 
+### 7.2 Reimportar un archivo editado (`cthg import`)
+
+Cuando el `CLAUDE.md` / `AGENTS.md` cambia, se vuelve a importar el mismo archivo: no hace falta borrar `.cthg/` ni se pierde lo aprendido con `learn`, `confirm` o `deny`. Cada bloque del archivo se casa con los nodos que **ese mismo archivo** importó antes (origen `importado` y `key` `<archivo>:L…`), en este orden:
+
+1. **Sin cambios**: el texto guardado (con su contexto de sección) es idéntico. El nodo se queda como está; solo su `key` sigue a la línea en la que está ahora, porque las líneas se desplazan cuando se añade algo encima.
+2. **Editado**: similitud ≥ 0,65 con un nodo del archivo que no se casó en el paso 1, o, si no hay ninguno, el nodo que ocupaba su sitio (entre los mismos bloques sin cambios, que equivale a «la misma `key`» aunque lo de encima se haya movido). Se crea un nodo **nuevo** con el texto nuevo y una arista `sustituye` nuevo → viejo. El texto viejo no se reescribe: Y solo avanza, y el viejo queda en el histórico, hundido. Si el viejo era `CORE`, el `CORE` pasa al nuevo.
+3. **Repetido**: se parece (≥ 0,65) a otro recuerdo visible, por ejemplo uno aprendido con `learn` o otro bloque del mismo archivo. No se crea nada, como en la primera importación. Lo que una edición ya sustituyó no cuenta.
+4. **Nuevo**: nodo nuevo.
+
+Los nodos del archivo que no se casaron con ningún bloque son **reglas borradas**: se marcan `STALE`, como hace `verify`, y pierden `CORE` (una regla que el archivo ya no dice no se inyecta en cada sesión). Es reversible: si el bloque vuelve, se quita `STALE` («restaurado») y el `CORE` se vuelve a proponer.
+
+Límites:
+
+- Lo que escribió `learn` (u otro origen que no sea `importado`) **nunca** se sustituye ni se marca, aunque el archivo diga lo mismo o deje de decirlo.
+- Como en `verify`, las marcas sobre nodos ya existentes (`STALE`, mover `CORE`) solo cambian **en el tronco**. En otra rama, una edición crea su nodo sustituto en esa rama (el tronco no lo ve) y lo borrado solo se lista («ya no está»).
+- Un nodo anclado no lo mueve `import`: si se borra, solo se lista; si se edita, el sustituto se crea, pero el anclado sigue en χ ≥ 0,9 hasta que `verify` le quite el ancla.
+- Un `STALE` que puso `verify` porque falta su ruta no lo quita `import`. Si lo puso por otra comprobación (símbolo, dependencia) y el bloque sigue en el archivo, `import` lo quita y el siguiente `verify` lo vuelve a poner.
+- La evidencia del nodo viejo (`confirm`) no pasa al nuevo, igual que con `learn --supersedes`: se confirmó otra redacción.
+
+Importar dos veces el mismo archivo no cambia nada: todo cae en el paso 1, lo sustituido ya no cuenta y lo obsoleto ya estaba marcado.
+
+Ejemplo con números (prior de `importado` (5; 1,5) → A = 0,54; e = 4,5 → w = 3/7,5 = 0,4):
+
+- Un bloque sin cambios o recién importado: χ = 0,4·0 + 0,6·0,54 = **0,32**.
+- El bloque viejo de una edición: lo sustituye un nodo visible con χ = 0,32 > 0, así que E = −1 → χ = −0,4 + 0,32 = **−0,08** (sin evidencia, ya sin peso frente al nuevo).
+- Un bloque borrado: `STALE` → E = −1 → también **−0,08**. Si vuelve al archivo, otra vez **0,32**.
+
 ---
 
 ## 8. Estructura del repositorio
@@ -378,7 +405,7 @@ Además:
 │  │     ├─ spatial.rs        eje X: normalizar, antecesores, afinidad, renombres
 │  │     ├─ retrieve.rs       canales, semillas, propagación, ranking, presupuesto
 │  │     ├─ learn.rs          aprender, planes, consolidación, feedback, olvido, hebb
-│  │     ├─ import.rs         importar Markdown, deducir rutas y proponer CORE
+│  │     ├─ import.rs         importar Markdown, deducir rutas, proponer CORE y seguir las ediciones
 │  │     ├─ hook.rs           hooks de Claude Code, deduplicación por sesión
 │  │     ├─ verify.rs         verificar rutas, símbolos, dependencias y comandos contra el repo
 │  │     ├─ eval.rs           medición: casos, 6 configuraciones, métricas, diagnóstico de fallos
@@ -407,7 +434,7 @@ En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`), `<r
 | `cthg recall [--prompt T] [--path P]… [--git] [--budget N] [--limit N]` | ✅ | canales 1–3 (rutas, símbolos de `git diff`, renombres `-M`) |
 | `cthg list [--all]` | ✅ | todos los nodos con χ, flags (incluido `obsoleto`) y rama |
 | `cthg mv <de> <a>` | ✅ | la memoria sigue a un archivo o carpeta movidos |
-| `cthg import <archivo.md> [--yes]` | ✅ | parte el archivo en nodos y propone un `CORE` ordenado que cabe en 500 tokens (sección 12.6); cada nodo guarda su origen en `key` (`CLAUDE.md:L12`) y su contexto (sección 12.5) |
+| `cthg import <archivo.md> [--yes]` | ✅ | parte el archivo en nodos y propone un `CORE` ordenado que cabe en 500 tokens (sección 12.6); cada nodo guarda su origen en `key` (`CLAUDE.md:L12`) y su contexto (sección 12.5). Reimportar el archivo editado sustituye lo cambiado, marca `STALE` lo borrado y lista qué es nuevo, actualizado, obsoleto y restaurado (sección 7.2) |
 | `cthg hook <session-start\|prompt\|read\|edit>` | ✅ | lee el JSON del hook por stdin, deduplica por sesión en `.cthg/sesion/<session_id>.json` |
 | `cthg verify [--run-commands]` | ✅ | sección 7.1 |
 | `cthg eval <carpeta> [--markdown] [--repo DIR] [--file CLAUDE.md] [--core-auto]` | ✅ | sección 12; `--core-auto` ignora los `core:` y usa la propuesta de `import` |
@@ -482,7 +509,7 @@ relevantes: L7!, L15, L16!           (líneas del CLAUDE.md; ! = crítica; vací
 core: L7                             (opcional: otro CORE para este caso)
 ```
 
-Las líneas se refieren al archivo gracias a `node.key = "<archivo>:L<línea>"`, que `import` rellena con la primera línea de cada bloque.
+Las líneas se refieren al archivo gracias a `node.key = "<archivo>:L<línea>"`, que `import` rellena con la primera línea de cada bloque (y actualiza si el bloque se desplaza al reimportar, sección 7.2).
 
 Las etiquetas de un repo real las pone una persona. Un caso con `relevantes:` vacío se lista como «sin etiquetar» y no cuenta.
 

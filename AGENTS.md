@@ -17,7 +17,7 @@ Las dos tienen que terminar limpias: tests en verde y clippy sin avisos.
 
 ## Cómo trabajar
 
-1. **Una fase por encargo**, en el orden de la sección 13 de la guía. Las siguientes son la **2** (`import`) y la **4** (`hook`). No empieces otra fase sin que te la pidan.
+1. **Una fase por encargo**, en el orden de la sección 13 de la guía: la tabla de fases dice cuál es la siguiente. No empieces otra fase sin que te la pidan.
 2. Antes de escribir código, resume en pocas líneas qué vas a hacer y qué archivos vas a tocar.
 3. Cada pieza nueva lleva **tests** en el mismo módulo (`#[cfg(test)] mod tests`), con el estilo de los que ya hay: casos concretos con nombres que dicen qué demuestran.
 4. Al terminar una fase:
