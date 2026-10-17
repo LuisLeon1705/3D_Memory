@@ -8,10 +8,13 @@ use cthg_core::model::*;
 use cthg_core::retrieve::{self, Query};
 use cthg_core::score::{self, certainty_tag, View};
 use cthg_core::spatial::{self, Target};
+use cthg_core::verify::{self, RepoProbe, VerifyAction};
 use cthg_core::{binary, hook, import, text};
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 const DIR: &str = ".cthg";
 const FILE: &str = "memoria.cthg";
@@ -20,6 +23,10 @@ const SES_DIR: &str = "sesion";
 const NOISE: &[&str] = &["Cargo.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock"];
 const NOISE_DIRS: &[&str] = &["target/", "node_modules/", "dist/", "build/", ".cthg/"];
 const MAX_GIT_PATHS: usize = 12;
+/// A lock older than this was left by a crashed writer.
+const STALE_LOCK: Duration = Duration::from_secs(30);
+/// Hooks wait less than commands: if the memory is busy they answer read-only.
+const HOOK_LOCK_WAIT: Duration = Duration::from_millis(1500);
 
 const HELP: &str = "cthg — memoria de proyecto (ruta · tiempo · confianza)
 
@@ -29,14 +36,15 @@ const HELP: &str = "cthg — memoria de proyecto (ruta · tiempo · confianza)
              [--contradicts N] [--supersedes N] [--origin usuario|agente|repo|importado]
              [--core] [--plan] [--deny]
   cthg confirm <id>      cthg deny <id>
-  cthg core [<id>...] [--budget N]
+  cthg core [<id>... [--unset]] [--budget N]
   cthg recall [--prompt <texto>] [--path P]... [--git] [--budget N] [--limit N]
   cthg list [--all]
   cthg mv <de> <a>       (la memoria sigue a un archivo o carpeta movidos)
   cthg import <archivo.md> [--yes]
   cthg hook <session-start|prompt|read|edit>
+  cthg verify [--run-commands]
 
-Pendiente: verify (fase 5), gc y view (fase 7).";
+Pendiente: gc y view (fase 7).";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -57,7 +65,7 @@ struct Args {
     opts: Vec<(String, Option<String>)>,
 }
 
-const FLAGS: &[&str] = &["core", "plan", "deny", "git", "all", "yes"];
+const FLAGS: &[&str] = &["core", "plan", "deny", "git", "all", "yes", "unset", "run-commands"];
 
 impl Args {
     fn parse(raw: &[String]) -> Result<Self, String> {
@@ -123,6 +131,15 @@ struct Repo {
     file: PathBuf,
 }
 
+/// Held while the memory is being modified; dropping it releases `.cthg/lock`.
+struct Lock(PathBuf);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 impl Repo {
     fn open() -> Self {
         Self::open_at(None)
@@ -141,6 +158,36 @@ impl Repo {
     fn save(&self, m: &Memory) -> Result<(), String> {
         binary::save(m, &self.file).map_err(|e| e.to_string())
     }
+    /// Exclusive `.cthg/lock` for one load-modify-save, waiting up to `wait`. Without it two
+    /// writers (a hook and `cthg learn`) can each save their own copy and one change is lost.
+    fn lock(&self, wait: Duration) -> Option<Lock> {
+        let path = self.root.join(DIR).join("lock");
+        let deadline = Instant::now() + wait;
+        loop {
+            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_) => return Some(Lock(path)),
+                Err(_) => {
+                    let age = fs::metadata(&path).ok().and_then(|md| md.modified().ok()).and_then(|t| t.elapsed().ok());
+                    if age.is_some_and(|a| a > STALE_LOCK) {
+                        // Left behind by a writer that crashed.
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    }
+    /// Lock, then load: the memory to modify and the guard that must live until it is saved.
+    fn load_locked(&self) -> Result<(Memory, Lock), String> {
+        let lock = self
+            .lock(Duration::from_secs(5))
+            .ok_or("la memoria está en uso por otro proceso (.cthg/lock); inténtalo de nuevo")?;
+        Ok((self.load()?, lock))
+    }
     /// Current branch, or "" on trunk / outside git.
     fn branch(&self, m: &Memory) -> String {
         let cur = git(&self.root, &["rev-parse", "--abbrev-ref", "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default();
@@ -153,8 +200,9 @@ impl Repo {
     fn commit(&self) -> String {
         git(&self.root, &["rev-parse", "--short", "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default()
     }
-    /// Applies any `git diff -M` / `git status` renames to `m` and returns ranked spatial targets
-    /// with touched symbols from diff hunk headers.
+    /// Ranked spatial targets from `git status` / `git diff -M`, with the symbols that really
+    /// enclose each hunk. On the trunk it also moves memories after renames; on another branch
+    /// it does not, because the trunk still has the old paths (use `cthg mv` there).
     fn sync_git_and_targets(&self, m: &mut Memory) -> (Vec<Target>, usize) {
         let status = git(&self.root, &["status", "--porcelain=v1"]).unwrap_or_default();
         let diff = git(&self.root, &["diff", "-M", "-U0", "HEAD"]).unwrap_or_else(|| {
@@ -162,10 +210,29 @@ impl Repo {
             let unstaged = git(&self.root, &["diff", "-M", "-U0"]).unwrap_or_default();
             format!("{staged}\n{unstaged}")
         });
-        let renames = spatial::parse_renames(&status, &diff);
-        let moved = spatial::apply_renames(m, &renames, |p| self.root.join(p).exists());
-        let targets = spatial::rank_git_targets(&status, &diff, NOISE, NOISE_DIRS, MAX_GIT_PATHS);
+        let moved = if self.branch(m).is_empty() {
+            let renames = spatial::parse_renames(&status, &diff);
+            spatial::apply_renames(m, &renames, |p| self.root.join(p).exists())
+        } else {
+            0
+        };
+        let mut targets = spatial::rank_git_targets(&status, &diff, NOISE, NOISE_DIRS, MAX_GIT_PATHS);
+        spatial::refine_symbols(&mut targets, &diff, |p| fs::read_to_string(self.root.join(p)).ok());
         (targets, moved)
+    }
+    /// Renames already committed, applied to memories whose path no longer exists (trunk only).
+    fn follow_committed_renames(&self, m: &mut Memory) -> usize {
+        if !self.branch(m).is_empty() {
+            return 0;
+        }
+        let Some(log) = git(&self.root, &["log", "-M", "--diff-filter=R", "--name-status", "--format="]) else {
+            return 0;
+        };
+        let renames: Vec<(String, String)> = spatial::parse_log_renames(&log)
+            .into_iter()
+            .filter(|(from, _)| !self.root.join(from).exists())
+            .collect();
+        spatial::apply_renames(m, &renames, |p| self.root.join(p).exists())
     }
 }
 
@@ -247,7 +314,7 @@ fn run(raw: &[String]) -> Result<(), String> {
             println!("memoria creada: {} (tronco: {trunk})", repo.file.display());
         }
         "learn" => {
-            let mut m = repo.load()?;
+            let (mut m, _lock) = repo.load_locked()?;
             let body = a.pos.join(" ");
             if text::tokens(&body).len() < 2 {
                 return Err("el texto necesita al menos dos palabras con contenido".into());
@@ -274,13 +341,19 @@ fn run(raw: &[String]) -> Result<(), String> {
                 }
             }
             let events = learn::learn(&mut m, &c, now());
-            repo.save(&m)?;
-            for e in events {
+            for e in &events {
                 println!("{:<12} #{:<4} χ {:+.2} → {:+.2}  {}", e.action, e.node, e.chi_before, e.chi_after, e.label);
             }
+            if c.origin == Origin::Repo {
+                // "The repo proves it" is checked, not taken on faith.
+                for e in events.iter().filter(|e| e.action == "nuevo") {
+                    check_repo_claim(&repo, &mut m, e.node);
+                }
+            }
+            repo.save(&m)?;
         }
         "confirm" | "deny" => {
-            let mut m = repo.load()?;
+            let (mut m, _lock) = repo.load_locked()?;
             let id = parse_id(&m, a.pos.first())?;
             let before = score::score_all(&m, &view(&repo, &m))[id as usize].chi;
             if !learn::feedback(&mut m, id, if cmd == "confirm" { 1 } else { -1 }) {
@@ -291,33 +364,47 @@ fn run(raw: &[String]) -> Result<(), String> {
             println!("#{id} χ {before:+.2} → {after:+.2}");
         }
         "core" => {
+            let budget = a.num("budget")?.unwrap_or(hook::BUDGET_CORE);
             if !a.pos.is_empty() {
-                let mut m = repo.load()?;
+                let (mut m, _lock) = repo.load_locked()?;
                 let mut ids = Vec::new();
                 for raw_id in &a.pos {
                     ids.push(parse_id(&m, Some(raw_id))?);
                 }
+                let unset = a.flag("unset");
                 for &id in &ids {
-                    m.nodes[id as usize].flags |= flags::CORE;
+                    if unset {
+                        m.nodes[id as usize].flags &= !flags::CORE;
+                    } else {
+                        m.nodes[id as usize].flags |= flags::CORE;
+                    }
                 }
                 repo.save(&m)?;
+                let action = if unset { "ya no core" } else { "core" };
                 for id in ids {
-                    println!("core         #{:<4} {}", id, m.nodes[id as usize].label);
+                    println!("{action:<12} #{:<4} {}", id, m.nodes[id as usize].label);
                 }
+                warn_core_overflow(&m, &score::score_all(&m, &view(&repo, &m)), budget);
                 return Ok(());
             }
             let m = repo.load()?;
             let scores = score::score_all(&m, &view(&repo, &m));
-            let budget = a.num("budget")?.unwrap_or(500);
             let ids = retrieve::core(&m, &scores);
             let ids = retrieve::fit_budget(&m, &ids, budget, |n| render(&m, &scores, n));
             if !ids.is_empty() {
                 println!("## Reglas del proyecto (siempre)");
                 print_bands(&m, &scores, &ids);
             }
+            warn_core_overflow(&m, &scores, budget);
         }
         "recall" => {
-            let mut m = repo.load()?;
+            // `--git` may move memories after renames, so it modifies and needs the lock.
+            let (mut m, _lock) = if a.flag("git") {
+                let (m, l) = repo.load_locked()?;
+                (m, Some(l))
+            } else {
+                (repo.load()?, None)
+            };
             let mut targets: Vec<Target> = a.all("path").iter().map(|p| Target::new(p, 1.0)).collect();
             if a.flag("git") {
                 let (git_ts, moved) = repo.sync_git_and_targets(&mut m);
@@ -354,7 +441,13 @@ fn run(raw: &[String]) -> Result<(), String> {
                     continue;
                 }
                 let mut tags = Vec::new();
-                for (f, t) in [(flags::CORE, "core"), (flags::ANCHORED, "anclado"), (flags::CONSOLIDATED, "consolidado"), (flags::POTENTIAL, "plan")] {
+                for (f, t) in [
+                    (flags::CORE, "core"),
+                    (flags::ANCHORED, "anclado"),
+                    (flags::CONSOLIDATED, "consolidado"),
+                    (flags::POTENTIAL, "plan"),
+                    (flags::STALE, "obsoleto"),
+                ] {
                     if n.has(f) {
                         tags.push(t);
                     }
@@ -372,9 +465,10 @@ fn run(raw: &[String]) -> Result<(), String> {
                     n.label
                 );
             }
+            warn_core_overflow(&m, &scores, hook::BUDGET_CORE);
         }
         "mv" => {
-            let mut m = repo.load()?;
+            let (mut m, _lock) = repo.load_locked()?;
             let (Some(from), Some(to)) = (a.pos.first(), a.pos.get(1)) else {
                 return Err("uso: cthg mv <de> <a>".into());
             };
@@ -383,7 +477,7 @@ fn run(raw: &[String]) -> Result<(), String> {
             println!("{moved} recuerdos movidos de {from} a {to}");
         }
         "import" => {
-            let mut m = repo.load()?;
+            let (mut m, _lock) = repo.load_locked()?;
             let file_arg = a.pos.first().ok_or("uso: cthg import <archivo.md> [--yes]")?;
             let arg_path = Path::new(file_arg);
             let full_path = if arg_path.exists() { arg_path.to_path_buf() } else { repo.root.join(arg_path) };
@@ -438,14 +532,115 @@ fn run(raw: &[String]) -> Result<(), String> {
                     "Para confirmarlas como CORE ejecuta:\n  cthg import {file_arg} --yes\no elige cuáles marcar con:\n  cthg core <id>..."
                 );
             }
+            warn_core_overflow(&m, &scores, hook::BUDGET_CORE);
         }
-        "verify" | "gc" | "view" => {
+        "verify" => {
+            let (mut m, _lock) = repo.load_locked()?;
+            let on_trunk = repo.branch(&m).is_empty();
+            let moved = repo.follow_committed_renames(&mut m);
+            if moved > 0 {
+                println!("{moved} recuerdos siguieron a archivos renombrados en commits anteriores");
+            }
+            let probe = RepoProbe {
+                path_exists: &|p| repo.root.join(p).exists(),
+                read_file: &|p| fs::read_to_string(repo.root.join(p)).ok(),
+                run_command: &|cmd| run_command(&repo.root, cmd),
+            };
+            let opts = verify::Options { apply: on_trunk, run_commands: a.flag("run-commands"), only: None };
+            let v = view(&repo, &m);
+            let report = verify::verify(&mut m, &v, &probe, &opts);
+            repo.save(&m)?;
+            if !on_trunk {
+                println!("(rama {}: solo informe; anclas y obsolescencia se cambian en el tronco)", repo.branch(&m));
+            }
+            if report.events.is_empty() {
+                println!("sin cambios: lo comprobable sigue igual que en la última verificación");
+            }
+            for e in &report.events {
+                println!(
+                    "{:<12} #{:<4} χ {:+.2} → {:+.2}  {} ({})",
+                    e.action.name(),
+                    e.node,
+                    e.chi_before,
+                    e.chi_after,
+                    e.label,
+                    e.reason
+                );
+                if e.action == VerifyAction::Unanchored {
+                    println!("             ↳ se quitó el ancla (ANCHORED): única forma de que un hecho del repo pierda peso");
+                }
+            }
+            if !report.skipped_commands.is_empty() {
+                println!("\n{} comandos sin ejecutar (añade --run-commands para comprobarlos):", report.skipped_commands.len());
+                for (id, cmd) in &report.skipped_commands {
+                    println!("  #{id:<4} {cmd}");
+                }
+            }
+        }
+        "gc" | "view" => {
             return Err(format!("`{cmd}` aún no está implementado (ver GUIA.md, sección Fases)"));
         }
         "help" | "--help" | "-h" => println!("{HELP}"),
         other => return Err(format!("comando desconocido '{other}'\n\n{HELP}")),
     }
     Ok(())
+}
+
+/// Runs one memory command from the repo root. `verify` only passes commands without shell
+/// syntax; this checks again because it is the last step before a process starts.
+fn run_command(root: &Path, cmd: &str) -> Option<bool> {
+    if !verify::is_safe_command(cmd) {
+        return None;
+    }
+    let status = if cfg!(windows) {
+        // `cmd /C` so `npm`, `pnpm`… (`.cmd` shims) resolve; nothing left in `cmd` can chain or redirect.
+        Command::new("cmd").current_dir(root).args(["/C", cmd]).output().ok()?.status
+    } else {
+        let mut parts = cmd.split_whitespace();
+        Command::new(parts.next()?).current_dir(root).args(parts).output().ok()?.status
+    };
+    Some(status.success())
+}
+
+/// After `learn --origin repo`: anchored only if the repo really shows it.
+fn check_repo_claim(repo: &Repo, m: &mut Memory, id: u32) {
+    let probe = RepoProbe {
+        path_exists: &|p| repo.root.join(p).exists(),
+        read_file: &|p| fs::read_to_string(repo.root.join(p)).ok(),
+        run_command: &|_| None,
+    };
+    let opts = verify::Options { apply: true, run_commands: false, only: Some(vec![id]) };
+    let v = view(repo, m);
+    let report = verify::verify(m, &v, &probe, &opts);
+    match report.events.iter().find(|e| e.node == id) {
+        Some(e) if matches!(e.action, VerifyAction::Verified | VerifyAction::Anchored) => {
+            println!("comprobado   #{id:<4} {}", e.reason);
+        }
+        Some(e) => println!("aviso: el repo no lo confirma ({}); #{id} queda sin ancla", e.reason),
+        None => {
+            // Nothing checkable (no path, symbol or dependency): it is the user's word, not the repo's.
+            let n = &mut m.nodes[id as usize];
+            n.flags &= !flags::ANCHORED;
+            n.origin = Origin::User;
+            (n.alpha, n.beta) = Origin::User.prior();
+            println!("aviso: nada que comprobar en el repo; #{id} queda como afirmación del usuario");
+        }
+    }
+}
+
+/// Core rules that don't fit the session-start budget are never injected: say so, loudly.
+fn warn_core_overflow(m: &Memory, scores: &[score::Score], budget: usize) {
+    let all = retrieve::core(m, scores);
+    let kept = retrieve::fit_budget(m, &all, budget, |n| render(m, scores, n));
+    if kept.len() < all.len() {
+        let dropped: Vec<String> = all.iter().filter(|id| !kept.contains(id)).map(|id| format!("#{id}")).collect();
+        eprintln!(
+            "aviso: {} de {} reglas CORE no caben en {budget} tokens y no se inyectarán: {}\n       quita alguna con `cthg core --unset <id>` o dale una ruta",
+            dropped.len(),
+            all.len(),
+            dropped.join(" ")
+        );
+    }
 }
 
 fn run_hook(rest: &[String]) -> Result<(), String> {
@@ -455,8 +650,15 @@ fn run_hook(rest: &[String]) -> Result<(), String> {
     let input = hook::HookInput::parse(&raw_json);
     let start = (!input.cwd.is_empty()).then(|| Path::new(&input.cwd));
     let repo = Repo::open_at(start);
+    // Busy memory: still answer, but read-only (the context matters more than the activation).
+    let lock = repo.lock(HOOK_LOCK_WAIT);
     let mut m = repo.load()?;
     let ses_dir = repo.root.join(DIR).join(SES_DIR);
+    let save = |m: &Memory| {
+        if lock.is_some() {
+            let _ = repo.save(m);
+        }
+    };
 
     match event {
         "session-start" => {
@@ -464,7 +666,7 @@ fn run_hook(rest: &[String]) -> Result<(), String> {
             let v = view(&repo, &m);
             let out = hook::handle_session_start(&mut m, &v, &mut session);
             let _ = session.save(&ses_dir);
-            let _ = repo.save(&m);
+            save(&m);
             if !out.is_empty() {
                 println!("{out}");
             }
@@ -475,7 +677,7 @@ fn run_hook(rest: &[String]) -> Result<(), String> {
             let v = view(&repo, &m);
             let out = hook::handle_prompt(&mut m, &v, &mut session, &input.prompt, git_ts);
             if !out.is_empty() || moved > 0 {
-                let _ = repo.save(&m);
+                save(&m);
             }
             if !out.is_empty() {
                 let _ = session.save(&ses_dir);
@@ -489,14 +691,14 @@ fn run_hook(rest: &[String]) -> Result<(), String> {
             let out = hook::handle_read(&mut m, &v, &mut session, &rel);
             if !out.is_empty() {
                 let _ = session.save(&ses_dir);
-                let _ = repo.save(&m);
+                save(&m);
                 println!("{out}");
             }
         }
         "edit" => {
             let rel = hook::relativize_path(&repo.root, &input.file_path);
             if hook::handle_edit(&mut m, &rel) > 0 {
-                let _ = repo.save(&m);
+                save(&m);
             }
         }
         _ => {}

@@ -1,15 +1,17 @@
-# Formato `.cthg` (versión 1)
+# Formato `.cthg` (versión 2)
 
 Little endian. Cadenas = `u32` longitud + bytes UTF-8. Listas de ids = `u32` cuenta + `u32`×n.
 
 ```text
-cabecera   "CTHG" | u16 versión (=1) | u16 reservado (=0) | u32 nº de secciones
+cabecera   "CTHG" | u16 versión (=2; se lee también 1) | u16 reservado (=0) | u32 nº de secciones
 sección*   [u8;4] etiqueta | u32 longitud | carga
 cola       u32 CRC32 (IEEE) de todos los bytes anteriores
 ```
 
 Las secciones desconocidas se saltan: un lector viejo abre un archivo nuevo.
-Al guardar: se escribe `memoria.cthg.tmp`, el archivo anterior se copia a `memoria.cthg.bak` y se renombra (atómico).
+Al guardar: con `.cthg/lock` tomado, cada escritor escribe su propio `memoria.cthg.<pid>.<ns>.tmp`, copia el archivo anterior a `memoria.cthg.bak` y renombra (atómico). Al leer, si el archivo falla (CRC, truncado), se carga `memoria.cthg.bak`.
+
+Versión 2 = versión 1 + el bit 4 de `flags` (`STALE`). La disposición de bytes es la misma, por eso un archivo v1 se lee tal cual.
 
 ## META
 `u32 sesión` · `u32 n` · n × (`str clave`, `str valor`)
@@ -24,7 +26,7 @@ Claves usadas: `trunk` (rama tronco), `created` (Unix).
 | id | u32 | consecutivo desde 0 (se valida) |
 | kind | u8 | 0 regla · 1 decision · 2 hecho · 3 incidente · 4 convencion · 5 plan · 6 comando · 7 sesion |
 | origin | u8 | 0 repo · 1 importado · 2 agente · 3 usuario · 4 sesion |
-| flags | u8 | bit0 ANCHORED · bit1 CONSOLIDATED · bit2 CORE · bit3 POTENTIAL |
+| flags | u8 | bit0 ANCHORED · bit1 CONSOLIDATED · bit2 CORE · bit3 POTENTIAL · bit4 STALE (v2) |
 | path | str | X: ruta relativa con `/`; vacía = todo el proyecto |
 | symbol | str | X fino: función o tipo; vacío = la ruta entera |
 | branch | str | rama donde se aprendió; vacía = tronco |

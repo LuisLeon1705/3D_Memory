@@ -133,6 +133,9 @@ pub mod flags {
     /// A plan: a possible future, not a fact. It never becomes true by time passing,
     /// only when something later shows it happened.
     pub const POTENTIAL: u8 = 1 << 3;
+    /// `verify` found that its path, symbol, dependency or command no longer holds.
+    /// Structural, not evidence: it sinks χ while set and lifts when `verify` passes again.
+    pub const STALE: u8 = 1 << 4;
 }
 
 #[derive(Clone, Debug)]

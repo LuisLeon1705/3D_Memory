@@ -39,6 +39,8 @@ pub struct FileDiff {
     pub path: String,
     pub symbols: Vec<String>,
     pub lines: usize,
+    /// First line of each hunk in the new file (`+N` of `@@ -a,b +N,M @@`).
+    pub hunk_starts: Vec<usize>,
 }
 
 /// `/`-separated, relative, no `./`, no trailing slash. `\` becomes `/`.
@@ -204,7 +206,7 @@ pub fn parse_diff(diff: &str) -> Vec<FileDiff> {
         if let Some(i) = out.iter().position(|f| f.path == p) {
             Some(i)
         } else {
-            out.push(FileDiff { path: p, symbols: Vec::new(), lines: 0 });
+            out.push(FileDiff { path: p, symbols: Vec::new(), lines: 0, hunk_starts: Vec::new() });
             Some(out.len() - 1)
         }
     };
@@ -230,6 +232,9 @@ pub fn parse_diff(diff: &str) -> Vec<FileDiff> {
         } else if line.starts_with("@@ ") {
             if let Some(i) = cur_idx {
                 out[i].lines += hunk_line_count(line);
+                if let Some(start) = hunk_new_start(line) {
+                    out[i].hunk_starts.push(start);
+                }
                 if let Some(sym) = extract_hunk_symbol(line) {
                     if !out[i].symbols.contains(&sym) {
                         out[i].symbols.push(sym);
@@ -257,6 +262,13 @@ fn hunk_line_count(header: &str) -> usize {
     total
 }
 
+fn hunk_new_start(header: &str) -> Option<usize> {
+    let rest = header.strip_prefix("@@ ")?;
+    let (ranges, _) = rest.split_once(" @@")?;
+    let plus = ranges.split_whitespace().find_map(|t| t.strip_prefix('+'))?;
+    plus.split(',').next()?.parse().ok()
+}
+
 /// Extracts the enclosing function or type name from a `@@ ... @@ <context>` hunk header.
 pub fn extract_hunk_symbol(header: &str) -> Option<String> {
     let rest = header.strip_prefix("@@ ")?;
@@ -265,7 +277,26 @@ pub fn extract_hunk_symbol(header: &str) -> Option<String> {
     if ctx.is_empty() {
         return None;
     }
+    if let Some(name) = declared_name(ctx) {
+        return Some(name);
+    }
 
+    // 3. Fallback: identifier immediately before `(` (e.g. `int Collider::broad_phase(int n)`).
+    if let Some((before_paren, _)) = ctx.split_once('(') {
+        let last_word = before_paren.split_whitespace().last()?;
+        let tail = last_word.rsplit("::").next().unwrap_or(last_word);
+        if let Some(ident) = clean_ident(tail) {
+            if !matches!(ident.as_str(), "if" | "for" | "while" | "match" | "switch" | "return" | "catch" | "sizeof") {
+                return Some(ident);
+            }
+        }
+    }
+    None
+}
+
+/// Name declared on one line (`fn x`, `def x`, `class X`, `impl X`…), or `None`.
+/// No call-like fallback: safe to use on arbitrary body lines.
+fn declared_name(ctx: &str) -> Option<String> {
     // 1. Explicit declaration keywords: `fn`, `def`, `function`, `func`, `struct`, `enum`, `trait`, `class`, `interface`, `type`, `mod`.
     let tokens: Vec<&str> = ctx.split_whitespace().collect();
     for (i, &tok) in tokens.iter().enumerate() {
@@ -294,30 +325,70 @@ pub fn extract_hunk_symbol(header: &str) -> Option<String> {
     }
 
     // 2. Rust `impl` header when no `fn` is on the line: `impl<T> Trait for Type` or `impl<T> Type`.
-    if tokens.iter().any(|t| t.starts_with("impl")) {
+    let is_impl = |t: &&str| *t == "impl" || t.starts_with("impl<");
+    if tokens.iter().any(is_impl) {
         if let Some(pos) = tokens.iter().position(|&t| t == "for") {
             if let Some(next) = tokens.get(pos + 1).and_then(|t| clean_ident(t)) {
                 return Some(next);
             }
         }
-        if let Some(pos) = tokens.iter().position(|t| t.starts_with("impl")) {
+        if let Some(pos) = tokens.iter().position(is_impl) {
             if let Some(next) = tokens.get(pos + 1).and_then(|t| clean_ident(t)) {
                 return Some(next);
             }
         }
     }
 
-    // 3. Fallback: identifier immediately before `(` (e.g. `int Collider::broad_phase(int n)`).
-    if let Some((before_paren, _)) = ctx.split_once('(') {
-        let last_word = before_paren.split_whitespace().last()?;
-        let tail = last_word.rsplit("::").next().unwrap_or(last_word);
-        if let Some(ident) = clean_ident(tail) {
-            if !matches!(ident.as_str(), "if" | "for" | "while" | "match" | "switch" | "return" | "catch" | "sizeof") {
-                return Some(ident);
+    None
+}
+
+/// The innermost declaration enclosing 1-based `line` of `source`: the closest line at or above
+/// it that declares something. Git's default hunk header misses indented methods (it shows
+/// `impl Collider {`), so the file itself is the reliable source.
+pub fn enclosing_symbol(source: &str, line: usize) -> Option<String> {
+    let above: Vec<&str> = source.lines().take(line.max(1)).collect();
+    let is_comment = |l: &str| ["//", "#", "/*", "*", "--"].iter().any(|c| l.starts_with(c));
+    above
+        .iter()
+        .map(|l| l.trim())
+        .rev()
+        .filter(|l| !is_comment(l))
+        .find_map(declared_name)
+}
+
+/// Replaces hunk-header symbols with the declarations that really enclose each hunk, read from
+/// the working tree. Header symbols are kept too, so type-level anchors (`Collider`) still match.
+pub fn refine_symbols(targets: &mut [Target], diff: &str, read_file: impl Fn(&str) -> Option<String>) {
+    let diffs = parse_diff(diff);
+    for t in targets.iter_mut() {
+        let Some(d) = diffs.iter().find(|d| d.path == t.path) else { continue };
+        let Some(source) = read_file(&t.path) else { continue };
+        let mut symbols: Vec<String> = d.hunk_starts.iter().filter_map(|&l| enclosing_symbol(&source, l)).collect();
+        for s in std::mem::take(&mut t.symbols) {
+            if !symbols.contains(&s) {
+                symbols.push(s);
             }
         }
+        symbols.dedup();
+        t.symbols = symbols;
     }
-    None
+}
+
+/// Renames already committed (`git log -M --diff-filter=R --name-status --format=`), oldest first,
+/// so a memory whose path vanished can follow the file before `verify` calls it deleted.
+pub fn parse_log_renames(log: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = log
+        .lines()
+        .filter(|l| l.starts_with('R'))
+        .filter_map(|l| {
+            let mut parts = l.split('\t');
+            let _ = parts.next();
+            Some((normalize(parts.next()?), normalize(parts.next()?)))
+        })
+        .filter(|(f, t)| !f.is_empty() && !t.is_empty() && f != t)
+        .collect();
+    out.reverse();
+    out
 }
 
 fn clean_ident(raw: &str) -> Option<String> {
@@ -450,5 +521,34 @@ rename to src/physics/collider.rs
         assert_eq!(moved, 2);
         assert_eq!(m.nodes[dir_rule as usize].path, "src/physics");
         assert_eq!(m.nodes[file_rule as usize].path, "src/physics/collider.rs");
+    }
+
+    #[test]
+    fn edited_method_inside_impl_is_the_symbol() {
+        // Git's default header shows `impl Collider {` for an indented method: the rule anchored at
+        // the edited method must not be penalised as "another symbol".
+        let source = "impl Collider {\n    pub fn broad_phase(&self) {\n        let a = 1;\n    }\n\n    // the type of contact\n    pub fn resolve_contacts(&self) {\n        let z = 3;\n    }\n}\n";
+        let diff = "diff --git a/src/core/collider.rs b/src/core/collider.rs\n--- a/src/core/collider.rs\n+++ b/src/core/collider.rs\n@@ -8 +8 @@ impl Collider {\n";
+        let mut ts = rank_git_targets(" M src/core/collider.rs\n", diff, &[], &[], 12);
+        assert_eq!(ts[0].symbols, vec!["Collider"], "header alone only knows the impl");
+        refine_symbols(&mut ts, diff, |_| Some(source.to_string()));
+        assert_eq!(ts[0].symbols, vec!["resolve_contacts", "Collider"]);
+        assert_eq!(affinity("src/core/collider.rs", "resolve_contacts", &ts[0]), 1.0);
+        assert_eq!(affinity("src/core/collider.rs", "broad_phase", &ts[0]), OTHER_SYMBOL);
+        assert_eq!(affinity("src/core/collider.rs", "Collider", &ts[0]), 1.0, "type-level anchors still match");
+        assert_eq!(enclosing_symbol(source, 3).as_deref(), Some("broad_phase"));
+        assert_eq!(enclosing_symbol("// implements x\nlet a = 1;\n", 2), None, "comments are not declarations");
+    }
+
+    #[test]
+    fn committed_renames_from_log_oldest_first() {
+        let log = "R100\tsrc/physics/collider.rs\tsrc/sim/collider.rs\n\nR095\tsrc/core/collider.rs\tsrc/physics/collider.rs\n";
+        assert_eq!(
+            parse_log_renames(log),
+            vec![
+                ("src/core/collider.rs".to_string(), "src/physics/collider.rs".to_string()),
+                ("src/physics/collider.rs".to_string(), "src/sim/collider.rs".to_string()),
+            ]
+        );
     }
 }

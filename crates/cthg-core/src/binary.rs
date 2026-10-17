@@ -7,7 +7,8 @@
 //! ```
 //! Sections: META, NODE, EDGE, HYPE. Strings are u32 length + UTF-8.
 //! Unknown sections are skipped, so newer writers stay readable.
-//! Saves are atomic: write `.tmp`, keep the previous file as `.bak`, rename.
+//! Saves are atomic: write a per-writer `.tmp`, keep the previous file as `.bak`, rename.
+//! A corrupt file loads from its `.bak`.
 
 use super::model::*;
 use std::fs;
@@ -15,7 +16,9 @@ use std::io;
 use std::path::Path;
 
 pub const MAGIC: &[u8; 4] = b"CTHG";
-pub const VERSION: u16 = 1;
+/// 2: flag bit 4 (`STALE`) exists. Same layout as 1, so version 1 files still load.
+pub const VERSION: u16 = 2;
+pub const OLDEST_READABLE: u16 = 1;
 
 fn crc32(data: &[u8]) -> u32 {
     static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
@@ -205,7 +208,7 @@ pub fn decode(bytes: &[u8]) -> io::Result<Memory> {
         return Err(bad("no es un archivo CTHG"));
     }
     let version = r.u16()?;
-    if version != VERSION {
+    if !(OLDEST_READABLE..=VERSION).contains(&version) {
         return Err(bad(&format!("versión {version} no soportada")));
     }
     r.u16()?;
@@ -314,16 +317,27 @@ pub fn save(m: &Memory, path: &Path) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("cthg.tmp");
+    // One temp file per writer: two processes saving at once must never share a half-written file.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("cthg.{}.{nanos}.tmp", std::process::id()));
     fs::write(&tmp, encode(m))?;
     if path.exists() {
         let _ = fs::copy(path, path.with_extension("cthg.bak"));
     }
-    fs::rename(&tmp, path)
+    fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
 }
 
+/// Loads the memory; if it is unreadable or corrupt, falls back to the `.bak` of the previous save.
 pub fn load(path: &Path) -> io::Result<Memory> {
-    decode(&fs::read(path)?)
+    match fs::read(path).and_then(|b| decode(&b)) {
+        Ok(m) => Ok(m),
+        Err(e) => fs::read(path.with_extension("cthg.bak")).and_then(|b| decode(&b)).map_err(|_| e),
+    }
 }
 
 #[cfg(test)]
@@ -348,5 +362,33 @@ mod tests {
         let mut broken = bytes.clone();
         broken[20] ^= 0xFF;
         assert!(decode(&broken).is_err());
+    }
+
+    #[test]
+    fn version_1_files_still_load() {
+        let mut m = Memory::default();
+        learn(&mut m, &Claim::rule("Los tests usan una semilla fija", "tests"), 1.0);
+        let mut v1 = encode(&m);
+        v1[4..6].copy_from_slice(&1u16.to_le_bytes());
+        let n = v1.len() - 4;
+        let crc = crc32(&v1[..n]);
+        v1[n..].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(decode(&v1).unwrap().nodes.len(), m.nodes.len());
+    }
+
+    #[test]
+    fn corrupt_file_falls_back_to_backup() {
+        let dir = std::env::temp_dir().join(format!("cthg-bak-{}", std::process::id()));
+        let path = dir.join("memoria.cthg");
+        let mut m = Memory::default();
+        learn(&mut m, &Claim::rule("Primera regla del proyecto", ""), 1.0);
+        save(&m, &path).unwrap();
+        learn(&mut m, &Claim::rule("Segunda regla distinta del todo", ""), 2.0);
+        save(&m, &path).unwrap(); // .bak now holds the one-rule version
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[20] ^= 0xFF;
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(load(&path).unwrap().nodes.len(), 1, "previous save, not an error");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

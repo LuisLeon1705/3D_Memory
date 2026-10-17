@@ -16,4 +16,6 @@ Reglas de los hooks:
 1. **Nunca bloquear.** Si algo falla, salir con código 0 y sin salida.
 2. **No repetir.** `.cthg/sesion/<session_id>.json` guarda los ids ya inyectados en la sesión.
 3. **Presupuesto.** Núcleo ≤ 500 tokens, prompt ≤ 800, por archivo ≤ 300.
-4. `hook read` emite `{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"..."}}` para que Claude Code inyecte el contexto tras la lectura.
+4. **Sin carreras.** El hook espera hasta 1,5 s por `.cthg/lock`; si otro proceso la tiene, responde igual pero no guarda (se pierde un poco de activación, nunca un recuerdo).
+5. **Núcleo completo o avisado.** Si las reglas `CORE` no caben en 500 tokens, `session-start` añade una línea diciendo cuántas faltan.
+6. `hook read` emite `{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"..."}}` para que Claude Code inyecte el contexto tras la lectura.

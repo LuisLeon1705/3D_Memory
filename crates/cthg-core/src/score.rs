@@ -3,7 +3,8 @@
 //! Two readings of the same memory, blended:
 //! - Structural (E): deterministic propagation. Anchored facts are roots (E = 1). A node is as
 //!   determined as its best causal chain back to the roots: E = max(E(parent) · det(edge)).
-//!   Contradicting an established memory, or being superseded, gives E = −1. No support: E = 0.
+//!   Contradicting an established memory, being superseded, or being `STALE` (the repo no longer
+//!   matches it) gives E = −1. No support: E = 0.
 //! - Evidence (A): Bayesian. A = 2·α/(α+β) − 1 from the Beta evidence.
 //!
 //! χ = w·E + (1−w)·A, with w = K / (K + evidence): with little evidence the structure decides,
@@ -105,7 +106,7 @@ pub fn score_all(m: &Memory, view: &View) -> Vec<Score> {
                 let t = t as usize;
                 visible[t] && (m.nodes[t].anchored() || (rank[t] < rank[i] && out[t].chi > 0.5))
             });
-            if against {
+            if against || node.has(flags::STALE) {
                 -1.0
             } else {
                 parents[i]

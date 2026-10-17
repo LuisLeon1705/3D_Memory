@@ -13,3 +13,4 @@ pub mod retrieve;
 pub mod score;
 pub mod spatial;
 pub mod text;
+pub mod verify;

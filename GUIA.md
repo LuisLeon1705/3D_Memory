@@ -4,7 +4,7 @@ Memoria de proyecto para agentes de código (Claude Code primero). Objetivo: sus
 
 Motor: **CTHG** (*Causal-Temporal HyperGraph*): un grafo de recuerdos en un archivo binario, con tres ejes.
 
-Estado: `cthg-core` completo y probado (18 tests); CLI con `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list`, `mv`, `import` y `hook`. Faltan `verify` y la medición (ver [Fases](#13-fases)).
+Estado: `cthg-core` completo y probado (27 tests); CLI con `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list`, `mv`, `import`, `hook` y `verify`. Falta la medición y las herramientas de mantenimiento de la fase 7 (ver [Fases](#13-fases)).
 
 ---
 
@@ -35,7 +35,7 @@ Cada recuerdo es un **nodo**:
 | `y`, `commit`, `branch` | **Y**: cuándo y en qué rama se aprendió |
 | `alpha`, `beta` | evidencia a favor / en contra → **Z** (χ) |
 | `activation`, `recalls` | lo reciente que está (olvido) |
-| flags | `ANCHORED` (probado por el repo), `CORE` (siempre se inyecta), `POTENTIAL` (plan), `CONSOLIDATED` |
+| flags | `ANCHORED` (probado por el repo), `CORE` (siempre se inyecta), `POTENTIAL` (plan), `CONSOLIDATED`, `STALE` (el repo ya no coincide) |
 
 Y **aristas** entre nodos: `causa` (con su propio α/β = cuán determinista es), `contradice`, `sustituye` (nuevo → viejo), `relacion` (hebbiana), `menciona`, `precede`; más **hiperaristas** que agrupan varios nodos (un incidente, un PR, una decisión que tocó varios sitios).
 
@@ -65,7 +65,7 @@ Consecuencias:
 
 - Una regla del archivo exacto vale 1; la de su carpeta 0,8; la de la carpeta de encima 0,64. **Herencia**: una regla puesta en `src/core/` aplica a todo lo que cuelga de ahí, y lo más concreto pesa más.
 - La raíz (`""`) tiene afinidad 0 con todo: **una regla sin lugar en el árbol nunca se recupera por ruta**. Por eso las reglas transversales tienen que ser `CORE`.
-- **Renombres**: si `src/core` pasa a `src/physics`, todos los nodos con `src/core ⪯ path` se reescriben (`cthg mv`, y automático con `git diff -M`).
+- **Renombres**: si `src/core` pasa a `src/physics`, todos los nodos con `src/core ⪯ path` se reescriben (`cthg mv`; automático con `git diff -M` y, en `verify`, con los renombres ya confirmados en commits). Lo automático solo ocurre **en el tronco**: en otra rama el tronco sigue teniendo las rutas viejas.
 
 ### 3.2 Y — el tiempo, solo hacia delante
 
@@ -119,6 +119,7 @@ Confirmar suma 1 a α; negar suma 1 a β.
        ⎪ −1                                  si n contradice algo visible y establecido
        ⎪                                     (anclado, o anterior con χ > 0,5)
 E(n) = ⎨ −1                                  si lo sustituye un nodo visible con χ > 0
+       ⎪ −1                                  si está STALE (verify vio que el repo ya no coincide)
        ⎪ max  max(E(p), 0) · det(p→n)        sobre las causas visibles p de n
        ⎩ 0                                   si no tiene causas
 
@@ -192,7 +193,9 @@ peso = 1,0  archivo recién leído o pasado con --path
        0,5  sin seguimiento (??)
 ```
 
-Se descartan los lockfiles y `target/`, `node_modules/`, `dist/`, `build/`, `.cthg/`, se ordenan por peso y tamaño del diff (`git diff -M -U0`) con sus símbolos tocados (`@@`), y se toman como mucho 12 rutas.
+Se descartan los lockfiles y `target/`, `node_modules/`, `dist/`, `build/`, `.cthg/`, se ordenan por peso y tamaño del diff (`git diff -M -U0`) y se toman como mucho 12 rutas.
+
+**Símbolos tocados**: para cada hunk se lee el archivo y se busca hacia arriba, desde la primera línea del hunk, la declaración más cercana (`fn`, `def`, `function`, `class`, `impl`…; los comentarios no cuentan). La cabecera `@@` de git no basta: para un método indentado muestra `impl Collider {`, y una regla anclada en el método editado quedaba penalizada con σ = 0,5. Se guardan los dos (`resolve_contacts` y `Collider`), así las reglas ancladas al tipo también coinciden.
 
 **Fusión**:
 
@@ -323,6 +326,41 @@ La skill [skill/SKILL.md](skill/SKILL.md) le dice al agente cuándo hacer cada c
 - **Fase 7**: una rama fusionada se vuelve visible desde el tronco cuando el commit en que se aprendió es ancestro del tronco (`git merge-base --is-ancestor`). Las ramas abandonadas se archivan con `gc`.
 - **Obsolescencia**: ruta borrada, símbolo inexistente o regla sustituida → baja de χ. Nada se borra.
 
+### 7.1 Verificar contra el repo (`cthg verify`)
+
+Qué se comprueba, en orden (la primera comprobación que aplica decide):
+
+1. **Ruta**: el `path` existe.
+2. **Símbolo**: el `symbol` aparece como identificador en el archivo.
+3. **Dependencia**: solo si el recuerdo está anclado en un manifiesto (`Cargo.toml`, `package.json`) o habla de dependencias («dependencia», «crate», «paquete», «package»…). Así «el motor usa f64» no se confunde con una dependencia ausente.
+4. **Comando**: solo con `--run-commands`, y nunca si lleva sintaxis de shell (`&`, `|`, `;`, `>`, `$`, comillas…). Sin el flag se listan y no se ejecutan.
+
+Solo los **cambios de estado** mueven un recuerdo, así que `verify` dos veces seguidas no cambia nada:
+
+| Resultado | Estado antes | Después |
+|---|---|---|
+| comprobado | anclado | sigue anclado («verificado») |
+| comprobado | sin ancla, y es `hecho`, `comando` u origen `repo` | `ANCHORED` («anclado») |
+| comprobado o ruta existente | `STALE` | se quita `STALE` («restaurado») |
+| falla | anclado | pierde `ANCHORED`, gana `STALE`; si su origen es `repo`, (α, β) = (1,5; 4,5) («pierde ancla») |
+| falla | sin ancla | gana `STALE` («obsoleto») |
+| falla | `STALE` | nada |
+
+`STALE` es **estructural**, no evidencia: pone E = −1 mientras está y desaparece si el repo vuelve a coincidir, sin tocar α ni β. Por eso es reversible.
+
+Reglas, decisiones y convenciones **nunca** se anclan: que exista `resolve_contacts` demuestra dónde aplica una regla, no que la regla sea correcta. Que exista `Cargo.toml` tampoco demuestra «la versión es la 0.1».
+
+Ejemplos (los mismos números que da el CLI):
+
+- Regla del usuario cuyo archivo se borra: χ = 0,30 → E = −1, w = 0,5 → χ = −0,5 + 0,3 = **−0,20**. Al restaurar el archivo vuelve a **0,30**.
+- Hecho del repo cuya dependencia desaparece: (α, β) = (1,5; 4,5) → A = −0,5; e = 4 → w = 3/7 → χ = −3/7 − 4/7·0,5 = **−0,71** (dudoso).
+
+Además:
+
+- **Solo en el tronco** cambia anclas y obsolescencia; en otra rama, `verify` solo informa (un archivo borrado en `feature/x` sigue existiendo en `main`).
+- Antes de comprobar rutas, sigue los renombres ya confirmados en commits (`git log -M --diff-filter=R`), para no llamar «borrado» a un archivo movido.
+- `learn --origin repo` se comprueba en el acto. Si el repo lo confirma, queda anclado; si lo contradice, pierde el ancla; si no hay nada que comprobar, pasa a ser una afirmación del `usuario`. «Lo dice el repo» deja de ser algo que se pueda afirmar sin prueba.
+
 ---
 
 ## 8. Estructura del repositorio
@@ -342,6 +380,7 @@ La skill [skill/SKILL.md](skill/SKILL.md) le dice al agente cuándo hacer cada c
 │  │     ├─ learn.rs          aprender, planes, consolidación, feedback, olvido, hebb
 │  │     ├─ import.rs         importar Markdown, deducir rutas y proponer CORE
 │  │     ├─ hook.rs           hooks de Claude Code, deduplicación por sesión
+│  │     ├─ verify.rs         verificar rutas, símbolos, dependencias y comandos contra el repo
 │  │     ├─ text.rs           tokens es/en, similitud, recortes, tokens aproximados
 │  │     └─ binary.rs         formato .cthg (CRC32, guardado atómico)
 │  └─ cthg-cli/               binario `cthg`
@@ -351,7 +390,7 @@ La skill [skill/SKILL.md](skill/SKILL.md) le dice al agente cuándo hacer cada c
 └─ docs/formato-cthg.md       especificación byte a byte
 ```
 
-En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`) y `<repo>/.cthg/sesion/<session_id>.json` para no repetir lo ya inyectado. Si se versiona `.cthg/` o no se decide por proyecto (sección 14).
+En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`), `<repo>/.cthg/sesion/<session_id>.json` para no repetir lo ya inyectado y `<repo>/.cthg/lock` mientras alguien la modifica. Si se versiona `.cthg/` o no se decide por proyecto (sección 14).
 
 ---
 
@@ -362,13 +401,13 @@ En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`) y `<
 | `cthg init` | ✅ | crea `.cthg/memoria.cthg` en la raíz git; detecta el tronco |
 | `cthg learn <texto> [--kind K] [--path P] [--symbol S] [--cause T] [--cause-id N] [--contradicts N] [--supersedes N] [--origin O] [--core] [--plan] [--deny]` | ✅ | sección 6 |
 | `cthg confirm N` / `cthg deny N` | ✅ | α + 1 / β + 1 (lo anclado no se mueve) |
-| `cthg core [<id>…] [--budget N]` | ✅ | canal 0 (o marca nodos existentes como `CORE`) |
+| `cthg core [<id>… [--unset]] [--budget N]` | ✅ | canal 0; con ids, marca o desmarca `CORE`. Avisa si el núcleo no cabe en el presupuesto |
 | `cthg recall [--prompt T] [--path P]… [--git] [--budget N] [--limit N]` | ✅ | canales 1–3 (rutas, símbolos de `git diff`, renombres `-M`) |
-| `cthg list [--all]` | ✅ | todos los nodos con χ, flags y rama |
+| `cthg list [--all]` | ✅ | todos los nodos con χ, flags (incluido `obsoleto`) y rama |
 | `cthg mv <de> <a>` | ✅ | la memoria sigue a un archivo o carpeta movidos |
 | `cthg import <archivo.md> [--yes]` | ✅ | parte el archivo en nodos, deduce rutas existentes y propone cuáles son `CORE` |
 | `cthg hook <session-start\|prompt\|read\|edit>` | ✅ | lee el JSON del hook por stdin, deduplica por sesión en `.cthg/sesion/<session_id>.json` |
-| `cthg verify` | fase 5 | recomprueba lo anclado (rutas, símbolos, dependencias, comandos) |
+| `cthg verify [--run-commands]` | ✅ | sección 7.1 |
 | `cthg gc`, `cthg view` | fase 7 | archivar lo muerto; visor 3D con X = árbol de carpetas |
 
 ---
@@ -382,7 +421,7 @@ En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`) y `<
 | `PostToolUse` (`Read`) | `cthg hook read` | 2 (`hookSpecificOutput.additionalContext`) |
 | `PostToolUse` (`Edit\|MultiEdit\|Write`) | `cthg hook edit` | sube la activación de esa zona |
 
-Plantilla y reglas en [hooks/](hooks/README.md). En resumen: nunca bloquear (si falla, código 0 y sin salida), no repetir dentro de una sesión y respetar el presupuesto (500 / 800 / 300 tokens). Se instalan en el `.claude/settings.json` **del proyecto**, no en el global.
+Plantilla y reglas en [hooks/](hooks/README.md). En resumen: nunca bloquear (si falla, código 0 y sin salida), no repetir dentro de una sesión y respetar el presupuesto (500 / 800 / 300 tokens). Si la memoria está bloqueada por otro proceso más de 1,5 s, el hook responde igual pero no guarda. Si el núcleo no cabe en 500 tokens, `session-start` lo dice en el propio contexto, en vez de recortarlo en silencio. Se instalan en el `.claude/settings.json` **del proyecto**, no en el global.
 
 Los `CLAUDE.md` anidados por carpeta que Claude Code ya carga son la **línea base** contra la que medir.
 
@@ -390,7 +429,9 @@ Los `CLAUDE.md` anidados por carpeta que Claude Code ya carga son la **línea ba
 
 ## 11. Formato binario
 
-Un solo archivo con secciones `META`, `NODE`, `EDGE`, `HYPE` y CRC32 final; las secciones desconocidas se saltan; el guardado es atómico (`.tmp` → renombrar, el anterior queda en `.bak`). χ no se guarda: se calcula al cargar para la vista activa. Especificación completa: [docs/formato-cthg.md](docs/formato-cthg.md).
+Un solo archivo (versión 2; lee también la 1) con secciones `META`, `NODE`, `EDGE`, `HYPE` y CRC32 final; las secciones desconocidas se saltan.
+
+Escritura segura: toda modificación se hace con `.cthg/lock`; cada escritor usa su propio `.tmp` y renombra (el anterior queda en `.bak`); si el archivo está corrupto, se carga el `.bak`. Un candado de más de 30 s se considera abandonado. χ no se guarda: se calcula al cargar para la vista activa. Especificación completa: [docs/formato-cthg.md](docs/formato-cthg.md).
 
 Coste: con cientos o pocos miles de nodos, una puntuación completa es O(N log N + E) y tarda milisegundos. Lo caro son los tokens inyectados, no la CPU.
 
@@ -419,7 +460,7 @@ Criterio de éxito propuesto: ≥ 70 % menos tokens que el `CLAUDE.md` completo,
 | 2 | `import CLAUDE.md` | ✅ (14 tests) |
 | 3 | Canal espacial completo: símbolos desde los hunks de `git diff`, renombres automáticos (`-M`), ranking de rutas por tamaño del diff | ✅ (16 tests) |
 | 4 | `cthg hook` + deduplicación por sesión + instalar en un proyecto de prueba | ✅ (18 tests) |
-| 5 | `verify` (anclar y desanclar contra el repo) | pendiente |
+| 5 | `verify` (anclar y desanclar contra el repo), más arreglos: símbolo del método editado, aviso de núcleo desbordado, renombres solo en el tronco, candado de escritura, `core --unset` | ✅ (27 tests) |
 | 6 | Medición (sección 12) | pendiente |
 | 7 | Ramas fusionadas visibles en el tronco, `gc`, visor 3D | pendiente |
 
@@ -427,7 +468,8 @@ Criterio de éxito propuesto: ≥ 70 % menos tokens que el `CLAUDE.md` completo,
 
 ## 14. Riesgos abiertos
 
-- **Clasificar `CORE`** es el punto único de fallo restante. Mitigación: `import` propone, el usuario confirma, la medición lista cada fallo.
+- **Clasificar `CORE`** es el punto único de fallo restante. Mitigación: `import` propone, el usuario confirma, `core`/`list`/`import`/`session-start` avisan si el núcleo no cabe, y la medición lista cada fallo.
+- **Reformulaciones que cambian una palabra clave**: «depende del crate tokio» se toma como repetición de «depende del crate serde» (similitud 0,75 ≥ 0,5) y refuerza el recuerdo equivocado; lo mismo pasa con `git status` y `git status && git push`. Pendiente: exigir que las palabras que no comparten no sean nombres propios, identificadores o rutas, o subir el umbral cuando la frase es corta.
 - **Ruido espacial** en árboles sucios. Mitigación: ruido, ranking por tamaño del diff, máximo de rutas, pesos, presupuesto.
 - **Reglas del usuario empiezan en «probable» (0,30)**, no en «verificado». Es intencionado (una sola afirmación no es prueba), pero si en la medición eso hace que se ignoren, se sube el prior de `usuario`.
 - **Versionar `.cthg/` o no**: compartirlo con el equipo frente a mezclar correcciones personales. Se decide por proyecto.

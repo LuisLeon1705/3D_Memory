@@ -1,5 +1,6 @@
 /target
 *.cthg.tmp
+*.cthg.*.tmp
 *.cthg.bak
 # La memoria de cada repo vive en su propio .cthg/; aquí solo se ignora la de pruebas locales.
 /.cthg/

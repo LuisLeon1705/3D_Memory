@@ -216,7 +216,13 @@ pub fn handle_session_start(m: &mut Memory, view: &View, session: &mut SessionSt
             n.recalls += 1;
         }
     }
-    format_bands("## Reglas del proyecto (siempre)", m, &scores, &ids)
+    let mut out = format_bands("## Reglas del proyecto (siempre)", m, &scores, &ids);
+    // Never drop core rules silently: the agent should know some are missing.
+    let missing = candidates.len() - ids.len();
+    if missing > 0 {
+        out.push_str(&format!("\n({missing} reglas del núcleo no caben aquí; `cthg core` las muestra todas)"));
+    }
+    out
 }
 
 /// Runs `prompt`: fuses lexical and `git status`/`git diff` spatial channels within `BUDGET_PROMPT`.
@@ -465,5 +471,18 @@ mod tests {
         let encoded = session.encode();
         let decoded = SessionState::decode(&encoded).unwrap();
         assert_eq!(decoded, session);
+    }
+
+    #[test]
+    fn session_start_says_when_core_rules_do_not_fit() {
+        let mut m = Memory::default();
+        for i in 0..40 {
+            let words: Vec<String> = ["alfa", "beta", "gamma", "delta", "epsilon", "zeta", "theta", "kappa"].iter().map(|w| format!("{w}{i}")).collect();
+            let mut c = Claim::rule(&words.join(" "), "");
+            c.core = true;
+            learn(&mut m, &c, 100.0 + i as f64);
+        }
+        let out = handle_session_start(&mut m, &View::all(), &mut SessionState::new("s"));
+        assert!(out.contains("no caben aquí"), "{out}");
     }
 }
