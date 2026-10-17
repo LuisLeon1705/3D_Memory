@@ -1,0 +1,7 @@
+{
+  "cthg-memoria": {
+    "PreInvocation": [
+      { "type": "command", "command": "cthg hook antigravity", "timeout": 15 }
+    ]
+  }
+}

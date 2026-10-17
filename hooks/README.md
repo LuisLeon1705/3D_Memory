@@ -27,3 +27,28 @@ Reglas de los hooks:
 4. **Sin carreras.** El hook espera hasta 1,5 s por `.cthg/lock`; si otro proceso la tiene, responde igual pero no guarda (se pierde un poco de activación, nunca un recuerdo).
 5. **Núcleo completo o avisado.** Si las reglas `CORE` no caben en 500 tokens, `session-start` añade una línea diciendo cuántas faltan.
 6. `hook read` emite `{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"..."}}` para que Claude Code inyecte el contexto tras la lectura.
+
+## Google Antigravity
+
+Antigravity tiene hooks propios (`.agents/hooks.json`) con otro contrato:
+
+- **Solo `PreInvocation` puede añadir contexto.** Corre antes de cada llamada al modelo y usa `injectSteps: [{"ephemeralMessage": …}]`, que dura hasta el final del turno.
+- **`PostToolUse` debe devolver `{}`.**
+- **El prompt no llega por stdin**, pero sí `transcriptPath`, el registro de la conversación (una línea JSON por paso).
+
+Por eso basta un hook, sin tocar los permisos de las herramientas: [antigravity.hooks.json](antigravity.hooks.json) → `.agents/hooks.json` del proyecto.
+
+`cthg hook antigravity` lee solo las líneas nuevas del transcript (guarda por dónde iba en `.cthg/sesion/<conversationId>.json`):
+
+| Pasa esto | Inyecta |
+|---|---|
+| La primera llamada de la conversación | núcleo global y del proyecto, una sola vez (lo inyectado queda en la conversación) |
+| Un `USER_INPUT` nuevo (turno nuevo) | lo que recuerdan el mensaje y `git status`, sin repetir lo ya inyectado |
+| Un `view_file` nuevo en el turno | las reglas de ese archivo, una vez por turno |
+| `write_to_file` / `replace_file_content` | nada; sube la activación de esa zona |
+| Nada nuevo | `{}` |
+
+La skill va en `.agents/skills/project-memory/SKILL.md` (mismo archivo que [skill/SKILL.md](../skill/SKILL.md)). Antigravity además lee `AGENTS.md`/`GEMINI.md` por su cuenta, así que el hook no reinyecta lo importado de esos archivos (en Claude Code, lo mismo con `CLAUDE.md`).
+
+Para que valga en todos los proyectos, el mismo bloque puede ir en `~/.gemini/config/hooks.json`; en un repo sin memoria el hook responde `{}`.
+

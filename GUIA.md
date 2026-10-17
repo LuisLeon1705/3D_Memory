@@ -4,7 +4,7 @@ Memoria de proyecto para agentes de código (Claude Code primero). Objetivo: sus
 
 Motor: **CTHG** (*Causal-Temporal HyperGraph*): un grafo de recuerdos en un archivo binario, con tres ejes.
 
-Estado: `cthg-core` completo y probado (41 tests, más 1 del CLI); CLI con `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list`, `mv`, `import`, `hook`, `verify` y `eval`. Falta la medición sobre repos reales y la fase 7 (ver [Fases](#13-fases)).
+Estado: `cthg-core` completo y probado (46 tests, más 1 del CLI); funciona con Claude Code y con Google Antigravity; CLI con `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list`, `mv`, `import`, `hook`, `verify` y `eval`. Falta la medición sobre repos reales y la fase 7 (ver [Fases](#13-fases)).
 
 ---
 
@@ -217,7 +217,7 @@ r(i) = s(i)
 | Arista | ω | Para qué |
 |---|---|---|
 | causa | 0,45 · det | traer el **por qué** de una regla |
-| relacion | 0,25 + 0,5 · hebb | lo que suele ir junto |
+| relacion | 0 (inerte, ver 4.5) | — |
 | contradice, sustituye | 0,3 | traer lo que **ya se probó** y se descartó |
 | menciona | 0,2 | |
 | precede | 0,15 | |
@@ -225,8 +225,11 @@ r(i) = s(i)
 ### 4.4 Ranking y presupuesto
 
 ```
-R(n) = ( r(n) + 0,3·activación(n) ) · ( 0,6 + 0,4·χ(n) )        solo si r(n) > 0,05 y n no es CORE
+R(n) = ( r(n) + 0,3·activación(n) ) · ( 0,6 + 0,4·χ(n) )
+       solo si r(n) > max(0,05; 0,25 · max_m r(m)) y n no es CORE
 ```
+
+El corte relativo (un cuarto de la mejor coincidencia de la misma consulta) quita la cola de coincidencias débiles.
 
 El factor de confianza va de 0,2 (χ = −1) a 1 (χ = +1): lo descartado puede aparecer, pero abajo.
 
@@ -234,7 +237,9 @@ Después se recorta con un presupuesto de tokens (≈ caracteres/4), en orden de
 
 ### 4.5 Olvido y asociación
 
-Por sesión: `activación ← 0,92 · activación`, `hebb ← 0,995 · hebb`. Cuando un nodo se inyecta: `activación = 1`. Dos nodos inyectados juntos refuerzan su arista `relacion`: `hebb ← hebb + 0,15·(1 − hebb)`.
+Por sesión: `activación ← 0,92 · activación`. Cuando un nodo se inyecta: `activación = 1`.
+
+**Inyectados juntos no es asociados.** Antes, cada inyección unía con `relacion` a todos los pares de nodos inyectados a la vez. Cada inyección se volvía una camarilla, y una sola palabra que coincidiera arrastraba la camarilla entera, que al inyectarse volvía a reforzarse. Lo detectó el agente de Antigravity al usar la memoria: en este repo había 254 aristas `relacion` entre 36 nodos, y un mensaje cuya única palabra técnica era «tokens» inyectaba 23 nodos. Ahora la co-inyección solo refresca la activación, y las aristas `relacion` que existan no propagan (peso 0) hasta que algo aprenda asociaciones con sentido. El mismo mensaje inyecta 2 nodos. En los conjuntos de medición el recall no cambia, y los tokens bajan entre un 3 y un 9 %.
 
 ### 4.6 Ejemplo: «arréglalo» sin una sola palabra útil
 
@@ -407,6 +412,8 @@ Ejemplo con números (prior de `importado` (5; 1,5) → A = 0,54; e = 4,5 → w 
 │  │     ├─ learn.rs          aprender, planes, consolidación, feedback, olvido, hebb
 │  │     ├─ import.rs         importar Markdown, deducir rutas, proponer CORE y seguir las ediciones
 │  │     ├─ hook.rs           hooks de Claude Code, deduplicación por sesión
+│  │     ├─ antigravity.rs    hooks de Google Antigravity: transcript y mensaje efímero
+│  │     ├─ json.rs           lector JSON mínimo (sin dependencias)
 │  │     ├─ verify.rs         verificar rutas, símbolos, dependencias y comandos contra el repo
 │  │     ├─ eval.rs           medición: casos, 6 configuraciones, métricas, diagnóstico de fallos
 │  │     ├─ text.rs           tokens es/en, similitud, recortes, tokens aproximados
@@ -463,6 +470,21 @@ En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`), `<r
 Plantilla y reglas en [hooks/](hooks/README.md). En resumen: nunca bloquear (si falla, código 0 y sin salida), no repetir dentro de una sesión y respetar el presupuesto (500 / 800 / 300 tokens). Si la memoria está bloqueada por otro proceso más de 1,5 s, el hook responde igual pero no guarda. Si el núcleo no cabe en 500 tokens, `session-start` lo dice en el propio contexto, en vez de recortarlo en silencio. Se instalan en el `.claude/settings.json` **del proyecto**, no en el global. Llaman a `cthg` por su nombre: se instala en el PATH con `cargo install --path crates/cthg-cli --locked` (repetir tras cada cambio). Para ver la memoria, la app Memoria 3D (`memviz`, en `Memory-Handler/3D-Memory-Visualizer`) abre cualquier repo con memoria.
 
 Los `CLAUDE.md` anidados por carpeta que Claude Code ya carga son la **línea base** contra la que medir.
+
+### 10.1 Google Antigravity
+
+Mismo motor, otro contrato de hooks. En Antigravity solo `PreInvocation` puede añadir contexto, y lo hace como `ephemeralMessage`. No recibe el prompt, pero sí la ruta del transcript. Lo inyectado **queda en la conversación**: el transcript lo guarda como pasos `EPHEMERAL_MESSAGE`, y el modelo lo sigue viendo en el turno siguiente. `cthg hook antigravity` (en `.agents/hooks.json`) lee las líneas nuevas del transcript en cada llamada:
+
+| Paso nuevo en el transcript | Equivale al canal | Qué inyecta |
+|---|---|---|
+| primera llamada de la conversación | 0 | núcleo (global y proyecto), una sola vez |
+| `USER_INPUT` (turno nuevo) | 1 + 3 | lo que recuerdan el mensaje y `git status`, sin repetir nada ya inyectado |
+| `view_file` | 2 | las reglas de ese archivo, una vez por turno |
+| `write_to_file` / `replace_file_content` | — | sube la activación |
+
+La posición en el transcript y el turno se guardan en `.cthg/sesion/<conversationId>.json`. El olvido corre una vez por conversación.
+
+**Archivos que el agente ya carga.** Un recuerdo importado de un archivo de reglas que el agente lee por su cuenta no se vuelve a inyectar. Se reconoce por su `key`: `AGENTS.md:L12` o `GEMINI.md:L3` en Antigravity, `CLAUDE.md:L5` en Claude Code. Así no llega dos veces. Para que un proyecto ahorre tokens de verdad, conviene que ese archivo sea corto y que el resto viva en la memoria. Detalles en [hooks/README.md](hooks/README.md#google-antigravity).
 
 ---
 

@@ -53,6 +53,15 @@ impl HookInput {
 pub struct SessionState {
     pub session_id: String,
     pub injected: Vec<u32>,
+    /// Agents that only give a transcript (Antigravity): bytes of it already read.
+    pub offset: u64,
+    /// Step index of the last user message handled (a new one starts a new turn).
+    pub turn: i64,
+    /// The once-per-conversation forgetting step already ran.
+    pub started: bool,
+    /// Rule files the agent already loads by itself (`CLAUDE.md`, `AGENTS.md`…): memories
+    /// imported from them are never injected again. Set by the caller; not saved.
+    pub native: Vec<String>,
 }
 
 impl SessionState {
@@ -60,6 +69,10 @@ impl SessionState {
         SessionState {
             session_id: sanitize_session_id(session_id),
             injected: Vec::new(),
+            offset: 0,
+            turn: -1,
+            started: false,
+            native: Vec::new(),
         }
     }
 
@@ -86,6 +99,11 @@ impl SessionState {
         self.injected.contains(&id)
     }
 
+    /// Imported from a root rule file the agent loads by itself (`key` = `AGENTS.md:L12`).
+    pub fn is_native(&self, n: &Node) -> bool {
+        n.key.rsplit_once(":L").is_some_and(|(file, _)| self.native.iter().any(|f| f == file))
+    }
+
     pub fn record(&mut self, ids: &[u32]) {
         for &id in ids {
             if !self.injected.contains(&id) {
@@ -97,18 +115,26 @@ impl SessionState {
     pub fn encode(&self) -> String {
         let nums: Vec<String> = self.injected.iter().map(|n| n.to_string()).collect();
         format!(
-            "{{\"session_id\":\"{}\",\"injected\":[{}]}}\n",
+            "{{\"session_id\":\"{}\",\"injected\":[{}],\"offset\":{},\"turn\":{},\"started\":{}}}\n",
             escape_json(&self.session_id),
-            nums.join(",")
+            nums.join(","),
+            self.offset,
+            self.turn,
+            self.started
         )
     }
 
     pub fn decode(json: &str) -> Option<Self> {
-        let session_id = extract_str(json, "session_id").unwrap_or_else(|| "default".to_string());
-        let injected = extract_u32_array(json, "injected").unwrap_or_default();
+        let v = crate::json::Json::parse(json.trim())?;
+        let session_id = v.get("session_id").and_then(|x| x.str()).unwrap_or("default");
+        let num = |k: &str| v.get(k).and_then(|x| x.num());
         Some(SessionState {
-            session_id: sanitize_session_id(&session_id),
-            injected,
+            session_id: sanitize_session_id(session_id),
+            injected: v.get("injected").map(|a| a.arr().iter().filter_map(|x| x.num()).map(|n| n as u32).collect()).unwrap_or_default(),
+            offset: num("offset").unwrap_or(0.0) as u64,
+            turn: num("turn").unwrap_or(-1.0) as i64,
+            started: v.get("started") == Some(&crate::json::Json::Bool(true)),
+            native: Vec::new(),
         })
     }
 }
@@ -241,11 +267,18 @@ pub const DUPLICATE_OF_GLOBAL: f32 = 0.5;
 pub fn handle_session_start_layered(m: &mut Memory, view: &View, session: &mut SessionState, global: Option<&Memory>) -> String {
     session.injected.clear();
     learn::begin_session(m);
+    session.started = true;
+    core_context(m, view, session, global)
+}
+
+/// The `CORE` text (global layer, then the project's) without starting a session: for agents
+/// whose injected context only lasts one turn and must be given again on the next one.
+pub fn core_context(m: &mut Memory, view: &View, session: &mut SessionState, global: Option<&Memory>) -> String {
     let (global_out, used, global_toks) = global.map(|g| global_core(g, BUDGET_CORE)).unwrap_or_default();
     let scores = score::score_all(m, view);
     let candidates: Vec<u32> = retrieve::core(m, &scores)
         .into_iter()
-        .filter(|&id| !session.was_injected(id))
+        .filter(|&id| !session.was_injected(id) && !session.is_native(&m.nodes[id as usize]))
         .filter(|&id| {
             let toks = text::tokens(&m.nodes[id as usize].text);
             !global_toks.iter().any(|g| text::similarity(&toks, g) >= DUPLICATE_OF_GLOBAL)
@@ -288,7 +321,7 @@ pub fn handle_prompt(
     let candidates: Vec<u32> = retrieve::recall(m, &scores, &q, 40, -1.0)
         .into_iter()
         .map(|r| r.id)
-        .filter(|&id| !session.was_injected(id))
+        .filter(|&id| !session.was_injected(id) && !session.is_native(&m.nodes[id as usize]))
         .collect();
     let ids = retrieve::fit_budget(m, &candidates, BUDGET_PROMPT, |n| render_node(m, &scores, n));
     if ids.is_empty() {
@@ -323,7 +356,7 @@ pub fn read_context(m: &mut Memory, view: &View, session: &mut SessionState, rel
     let candidates: Vec<u32> = retrieve::recall(m, &scores, &q, 40, -1.0)
         .into_iter()
         .map(|r| r.id)
-        .filter(|&id| !session.was_injected(id))
+        .filter(|&id| !session.was_injected(id) && !session.is_native(&m.nodes[id as usize]))
         .collect();
     let ids = retrieve::fit_budget(m, &candidates, BUDGET_READ, |n| render_node(m, &scores, n));
     if ids.is_empty() {
@@ -436,25 +469,6 @@ fn parse_json_string(s: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn extract_u32_array(json: &str, key: &str) -> Option<Vec<u32>> {
-    let needle = format!("\"{key}\"");
-    let pos = json.find(&needle)?;
-    let after = &json[pos + needle.len()..];
-    let open = after.find('[')?;
-    let close = after[open + 1..].find(']')?;
-    let body = &after[open + 1..open + 1 + close];
-    let mut out = Vec::new();
-    for item in body.split(',') {
-        let t = item.trim();
-        if !t.is_empty() {
-            if let Ok(n) = t.parse::<u32>() {
-                out.push(n);
-            }
-        }
-    }
-    Some(out)
 }
 
 #[cfg(test)]
@@ -589,4 +603,27 @@ mod tests {
         let plain = handle_session_start(&mut m2, &View::all(), &mut SessionState::new("p"));
         assert!(!plain.contains("globales") && plain.contains("push directo"));
     }
+
+    #[test]
+    fn rules_the_agent_already_loads_are_not_injected_twice() {
+        let mut m = Memory::default();
+        let mut own = Claim::rule("No uses unwrap en el colisionador", "src/core/collider.rs");
+        own.core = true;
+        let own = learn(&mut m, &own, 1.0)[0].node;
+        let mut imported = Claim::rule("Nunca hagas push directo a main", "");
+        imported.core = true;
+        let imported = learn(&mut m, &imported, 2.0)[0].node;
+        m.nodes[imported as usize].key = "AGENTS.md:L7".into();
+
+        let mut session = SessionState::new("n");
+        session.native = vec!["AGENTS.md".into(), "GEMINI.md".into()];
+        let out = handle_session_start(&mut m, &View::all(), &mut session);
+        assert!(session.was_injected(own) && !out.contains("push directo"), "{out}");
+
+        // Claude Code does not load AGENTS.md: there the same memory is injected.
+        let mut claude = SessionState::new("c");
+        claude.native = vec!["CLAUDE.md".into()];
+        assert!(handle_session_start(&mut m, &View::all(), &mut claude).contains("push directo"));
+    }
 }
+

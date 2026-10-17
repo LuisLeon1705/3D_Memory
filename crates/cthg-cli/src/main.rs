@@ -41,7 +41,8 @@ const HELP: &str = "cthg — memoria de proyecto (ruta · tiempo · confianza)
   cthg list [--all]
   cthg mv <de> <a>       (la memoria sigue a un archivo o carpeta movidos)
   cthg import <archivo.md> [--yes]
-  cthg hook <session-start|prompt|read|edit>
+  cthg hook <session-start|prompt|read|edit>     (Claude Code)
+  cthg hook antigravity                          (Google Antigravity, PreInvocation)
   cthg verify [--run-commands]
   cthg <init|learn|confirm|deny|core|list|import> --global   (memoria de todos los proyectos)
   cthg eval <carpeta> [--markdown] [--repo DIR] [--file CLAUDE.md] [--core-auto]
@@ -782,10 +783,89 @@ fn warn_core_overflow(m: &Memory, scores: &[score::Score], budget: usize) {
     }
 }
 
+/// Antigravity's `PreInvocation` hook (see `cthg_core::antigravity`): reads the transcript lines
+/// added since the last call and turns them into one ephemeral message.
+fn run_antigravity(raw: &str) -> Result<String, String> {
+    use cthg_core::antigravity::{self as agy, Step};
+    let p = agy::parse_payload(raw);
+    let start = (!p.workspace.is_empty()).then(|| Path::new(&p.workspace));
+    let repo = Repo::open_at(start);
+    let lock = repo.lock(HOOK_LOCK_WAIT);
+    let mut m = repo.load()?;
+    let ses_dir = repo.root.join(DIR).join(SES_DIR);
+    let sid = if p.conversation.is_empty() { "antigravity" } else { p.conversation.as_str() };
+    let mut session = hook::SessionState::load(&ses_dir, sid);
+    session.native = ANTIGRAVITY_NATIVE.iter().map(|s| s.to_string()).collect();
+
+    // Only what was appended since the last call.
+    let mut steps = Vec::new();
+    if let Ok(bytes) = fs::read(&p.transcript) {
+        if (bytes.len() as u64) < session.offset {
+            session.offset = 0; // a new or rewritten transcript
+        }
+        let fresh = String::from_utf8_lossy(&bytes[session.offset as usize..]).into_owned();
+        let (found, consumed) = agy::scan(&fresh);
+        session.offset += consumed as u64;
+        steps = found;
+    }
+
+    if !session.started {
+        learn::begin_session(&mut m);
+        session.started = true;
+    }
+    let v = view(&repo, &m);
+    let global = load_global();
+    let mut parts: Vec<String> = Vec::new();
+    // Injected messages stay in the conversation (the transcript keeps them as
+    // `EPHEMERAL_MESSAGE` steps and the model still sees them next turn): the CORE goes once,
+    // and nothing already injected in this conversation is injected again.
+    if session.turn == -1 {
+        parts.push(hook::core_context(&mut m, &v, &mut session, global.as_ref()));
+        session.turn = CORE_GIVEN;
+    }
+    let last_user = steps.iter().rposition(|s| matches!(s, Step::User { index, .. } if *index > session.turn));
+    if let Some(Step::User { index, text }) = last_user.map(|i| &steps[i]) {
+        let (git_ts, _) = repo.sync_git_and_targets(&mut m);
+        parts.push(hook::handle_prompt(&mut m, &v, &mut session, text, git_ts));
+        session.turn = *index;
+    }
+    // Files read in this turn (what came before its message belongs to a context already gone).
+    let from = last_user.map(|i| i + 1).unwrap_or(0);
+    for step in &steps {
+        if let Step::Edit(path) = step {
+            hook::handle_edit(&mut m, &hook::relativize_path(&repo.root, path));
+        }
+    }
+    for step in &steps[from..] {
+        if let Step::Read(path) = step {
+            let rel = hook::relativize_path(&repo.root, path);
+            parts.push(hook::read_context(&mut m, &v, &mut session, &rel));
+        }
+    }
+
+    let _ = session.save(&ses_dir);
+    if lock.is_some() {
+        let _ = repo.save(&m);
+    }
+    let text: Vec<String> = parts.into_iter().filter(|p| !p.trim().is_empty()).collect();
+    Ok(cthg_core::antigravity::inject(&text.join("\n\n")))
+}
+
+/// `SessionState::turn` once the CORE was given and before any user message was handled.
+const CORE_GIVEN: i64 = -2;
+/// Rule files Antigravity loads by itself, and Claude Code: their imported memories are skipped.
+const ANTIGRAVITY_NATIVE: &[&str] = &["AGENTS.md", "GEMINI.md"];
+const CLAUDE_NATIVE: &[&str] = &["CLAUDE.md"];
+
 fn run_hook(rest: &[String]) -> Result<(), String> {
     let event = rest.first().map(String::as_str).unwrap_or("");
     let mut raw_json = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw_json);
+    if event == "antigravity" {
+        // Antigravity always expects a JSON object on stdout, even when there is nothing to add.
+        println!("{}", run_antigravity(&raw_json).unwrap_or_else(|_| "{}".into()));
+        return Ok(());
+    }
     let input = hook::HookInput::parse(&raw_json);
     let start = (!input.cwd.is_empty()).then(|| Path::new(&input.cwd));
     let repo = Repo::open_at(start);
@@ -793,6 +873,7 @@ fn run_hook(rest: &[String]) -> Result<(), String> {
     let lock = repo.lock(HOOK_LOCK_WAIT);
     let mut m = repo.load()?;
     let ses_dir = repo.root.join(DIR).join(SES_DIR);
+    let native = || CLAUDE_NATIVE.iter().map(|s| s.to_string()).collect::<Vec<String>>();
     let save = |m: &Memory| {
         if lock.is_some() {
             let _ = repo.save(m);
@@ -802,6 +883,7 @@ fn run_hook(rest: &[String]) -> Result<(), String> {
     match event {
         "session-start" => {
             let mut session = hook::SessionState::new(&input.session_id);
+            session.native = native();
             let v = view(&repo, &m);
             let global = load_global();
             let out = hook::handle_session_start_layered(&mut m, &v, &mut session, global.as_ref());
@@ -813,6 +895,7 @@ fn run_hook(rest: &[String]) -> Result<(), String> {
         }
         "prompt" => {
             let mut session = hook::SessionState::load(&ses_dir, &input.session_id);
+            session.native = native();
             let (git_ts, moved) = repo.sync_git_and_targets(&mut m);
             let v = view(&repo, &m);
             let out = hook::handle_prompt(&mut m, &v, &mut session, &input.prompt, git_ts);
@@ -827,6 +910,7 @@ fn run_hook(rest: &[String]) -> Result<(), String> {
         "read" => {
             let rel = hook::relativize_path(&repo.root, &input.file_path);
             let mut session = hook::SessionState::load(&ses_dir, &input.session_id);
+            session.native = native();
             let v = view(&repo, &m);
             let out = hook::handle_read(&mut m, &v, &mut session, &rel);
             if !out.is_empty() {

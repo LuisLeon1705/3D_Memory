@@ -4,10 +4,12 @@
 //! - Y: when it was learned — Unix time, forward-only.
 //! - Z: how far to trust it — χ in [−1, 1], computed from structure and evidence (`score`).
 
+pub mod antigravity;
 pub mod binary;
 pub mod eval;
 pub mod hook;
 pub mod import;
+pub mod json;
 pub mod learn;
 pub mod model;
 pub mod retrieve;

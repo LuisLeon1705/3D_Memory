@@ -13,7 +13,6 @@ use super::spatial;
 use super::text;
 
 const ACTIVATION_DECAY: f32 = 0.92;
-const HEBB_RATE: f32 = 0.15;
 const HEBB_DECAY: f32 = 0.995;
 /// Minimum step of the Y axis, in seconds.
 const STEP: f64 = 1e-3;
@@ -342,20 +341,9 @@ pub fn begin_session(m: &mut Memory) {
 
 /// Memories injected together: they become associated and fresh.
 pub fn co_recalled(m: &mut Memory, ids: &[u32]) {
-    let mut ids = ids.to_vec();
-    ids.sort_unstable();
-    ids.dedup();
-    for (i, &a) in ids.iter().enumerate() {
-        for &b in &ids[i + 1..] {
-            let k = match m.find_edge(a, b, EdgeKind::Relates) {
-                Some(k) => k,
-                None => m.upsert_edge(a, b, EdgeKind::Relates, 1.0, 1.0),
-            };
-            let e = &mut m.edges[k];
-            e.hebb += HEBB_RATE * (1.0 - e.hebb);
-        }
-    }
-    for &id in &ids {
+    // Injected together is not associated: linking every pair turned each injection into a
+    // clique, and one matching word then pulled the whole clique back (a feedback loop).
+    for &id in ids {
         if let Some(n) = m.node_mut(id) {
             n.activation = 1.0;
             n.recalls += 1;

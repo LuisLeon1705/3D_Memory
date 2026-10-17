@@ -12,6 +12,11 @@ use super::score::Score;
 use super::spatial::{self, Target};
 use super::text;
 
+/// Below this relevance nothing comes back.
+pub const MIN_RELEVANCE: f32 = 0.05;
+/// Nor below this fraction of the best match of the same query.
+pub const RELATIVE_CUT: f32 = 0.25;
+
 /// An exact-file anchor weighs as much as naming the memory literally in the prompt.
 pub const W_SPATIAL: f32 = 2.0;
 
@@ -64,7 +69,10 @@ pub fn spread(m: &Memory, scores: &[Score], seeds: &[f32], min_chi: f32) -> Vec<
     for e in &m.edges {
         let w = match e.kind {
             EdgeKind::Causes => 0.45 * e.determinism(),
-            EdgeKind::Relates => 0.25 + 0.5 * e.hebb,
+            // Nothing records real associations yet: the old ones came from co-injection (every
+            // injected pair linked), a clique that pulled itself back on any match. Inert until
+            // something learns associations that mean something.
+            EdgeKind::Relates => 0.0,
             EdgeKind::Contradicts | EdgeKind::Supersedes => 0.3,
             EdgeKind::Mentions => 0.2,
             EdgeKind::Precedes => 0.15,
@@ -108,11 +116,14 @@ pub fn recall(m: &Memory, scores: &[Score], q: &Query, limit: usize, min_chi: f3
         })
         .collect();
     let rel = spread(m, scores, &seeds, min_chi);
+    // The tail of weak matches is noise: keep what is at least a quarter as relevant as the best.
+    let best = rel.iter().copied().fold(0.0f32, f32::max);
+    let floor = MIN_RELEVANCE.max(RELATIVE_CUT * best);
 
     let mut out: Vec<Recall> = m
         .nodes
         .iter()
-        .filter(|node| rel[node.id as usize] > 0.05 && !node.has(flags::CORE))
+        .filter(|node| rel[node.id as usize] > floor && !node.has(flags::CORE))
         .map(|node| {
             let chi = scores[node.id as usize].chi;
             let recency = 0.3 * node.activation;
