@@ -1,0 +1,16 @@
+# Archivos que existen en el repo ficticio (sus carpetas existen implícitamente).
+# src/legacy/ no existe a propósito: esa regla queda sin ruta al importar.
+Cargo.toml
+src/core/mod.rs
+src/core/collider.rs
+src/core/body.rs
+src/core/world.rs
+src/net/protocol.rs
+src/net/server.rs
+src/ui/button.rs
+src/ui/menu.rs
+assets/i18n/es.ftl
+tests/integration/db.rs
+tests/physics/determinism.rs
+scripts/deploy.sh
+migrations/0001_init.sql

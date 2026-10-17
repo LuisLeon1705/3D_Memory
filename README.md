@@ -6,6 +6,7 @@ Memoria de proyecto para agentes de código: un núcleo pequeño que se inyecta 
 - Formato binario: [docs/formato-cthg.md](docs/formato-cthg.md)
 - Hooks de Claude Code: [hooks/](hooks/README.md)
 - Skill de aprendizaje: [skill/SKILL.md](skill/SKILL.md)
+- Medición: [eval/ejemplo/resultado.md](eval/ejemplo/resultado.md) (`cthg eval eval/ejemplo`)
 
 ```bash
 cargo test

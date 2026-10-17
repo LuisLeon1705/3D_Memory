@@ -252,6 +252,15 @@ pub fn handle_prompt(
 /// Runs `read`: just-in-time spatial recall for `rel_path` within `BUDGET_READ`, wrapped in
 /// `PostToolUse` `hookSpecificOutput.additionalContext` JSON.
 pub fn handle_read(m: &mut Memory, view: &View, session: &mut SessionState, rel_path: &str) -> String {
+    let context = read_context(m, view, session, rel_path);
+    if context.is_empty() {
+        return context;
+    }
+    format_post_tool_use(&context)
+}
+
+/// The plain context `read` injects (what `handle_read` wraps in JSON); `eval` counts its tokens.
+pub fn read_context(m: &mut Memory, view: &View, session: &mut SessionState, rel_path: &str) -> String {
     let rel_path = spatial::normalize(rel_path);
     if rel_path.is_empty() {
         return String::new();
@@ -273,8 +282,7 @@ pub fn handle_read(m: &mut Memory, view: &View, session: &mut SessionState, rel_
     session.record(&ids);
     learn::co_recalled(m, &ids);
     let heading = format!("## Memoria relevante ({rel_path})");
-    let context = format_bands(&heading, m, &scores, &ids);
-    format_post_tool_use(&context)
+    format_bands(&heading, m, &scores, &ids)
 }
 
 /// Runs `edit`: boosts activation on nodes anchored at `rel_path` or its ancestor directories.

@@ -4,7 +4,7 @@ Memoria de proyecto para agentes de código (Claude Code primero). Objetivo: sus
 
 Motor: **CTHG** (*Causal-Temporal HyperGraph*): un grafo de recuerdos en un archivo binario, con tres ejes.
 
-Estado: `cthg-core` completo y probado (27 tests); CLI con `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list`, `mv`, `import`, `hook` y `verify`. Falta la medición y las herramientas de mantenimiento de la fase 7 (ver [Fases](#13-fases)).
+Estado: `cthg-core` completo y probado (32 tests); CLI con `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list`, `mv`, `import`, `hook`, `verify` y `eval`. Falta la medición sobre repos reales y la fase 7 (ver [Fases](#13-fases)).
 
 ---
 
@@ -381,10 +381,12 @@ Además:
 │  │     ├─ import.rs         importar Markdown, deducir rutas y proponer CORE
 │  │     ├─ hook.rs           hooks de Claude Code, deduplicación por sesión
 │  │     ├─ verify.rs         verificar rutas, símbolos, dependencias y comandos contra el repo
+│  │     ├─ eval.rs           medición: casos, 6 configuraciones, métricas, diagnóstico de fallos
 │  │     ├─ text.rs           tokens es/en, similitud, recortes, tokens aproximados
 │  │     └─ binary.rs         formato .cthg (CRC32, guardado atómico)
 │  └─ cthg-cli/               binario `cthg`
 │     └─ src/main.rs
+├─ eval/ejemplo/              CLAUDE.md sintético, rutas.txt, casos.md y resultado.md
 ├─ hooks/                     settings.example.json + README
 ├─ skill/SKILL.md             cuándo escribir en la memoria
 └─ docs/formato-cthg.md       especificación byte a byte
@@ -405,9 +407,10 @@ En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`), `<r
 | `cthg recall [--prompt T] [--path P]… [--git] [--budget N] [--limit N]` | ✅ | canales 1–3 (rutas, símbolos de `git diff`, renombres `-M`) |
 | `cthg list [--all]` | ✅ | todos los nodos con χ, flags (incluido `obsoleto`) y rama |
 | `cthg mv <de> <a>` | ✅ | la memoria sigue a un archivo o carpeta movidos |
-| `cthg import <archivo.md> [--yes]` | ✅ | parte el archivo en nodos, deduce rutas existentes y propone cuáles son `CORE` |
+| `cthg import <archivo.md> [--yes]` | ✅ | parte el archivo en nodos, deduce rutas existentes y propone cuáles son `CORE`; cada nodo guarda su origen en `key` (`CLAUDE.md:L12`) |
 | `cthg hook <session-start\|prompt\|read\|edit>` | ✅ | lee el JSON del hook por stdin, deduplica por sesión en `.cthg/sesion/<session_id>.json` |
 | `cthg verify [--run-commands]` | ✅ | sección 7.1 |
+| `cthg eval <carpeta> [--markdown] [--repo DIR] [--file CLAUDE.md]` | ✅ | sección 12 |
 | `cthg gc`, `cthg view` | fase 7 | archivar lo muerto; visor 3D con X = árbol de carpetas |
 
 ---
@@ -437,17 +440,80 @@ Coste: con cientos o pocos miles de nodos, una puntuación completa es O(N log N
 
 ---
 
-## 12. Medición (antes de afirmar que «pesa menos y funciona igual»)
+## 12. Medición (`cthg eval`)
 
-1. Elegir uno o dos repos reales con un `CLAUDE.md` largo.
-2. Juntar 15–30 prompts de tarea reales y **marcar a mano** qué reglas eran relevantes en cada uno.
-3. Comparar por prompt:
-   - tokens inyectados: `CLAUDE.md` completo · `CLAUDE.md` anidados · 3D-Memory por canal;
-   - recall de reglas relevantes con presupuesto fijo: léxico · espacial · espacial + justo a tiempo · todo;
-   - lista de reglas relevantes **no** recuperadas, cada una con su causa (¿debía ser `CORE`? ¿mal anclada?).
-4. Opcional: repetir tareas reales con cada configuración y contar reglas violadas.
+### 12.1 Qué se mide
 
-Criterio de éxito propuesto: ≥ 70 % menos tokens que el `CLAUDE.md` completo, **cero** reglas críticas perdidas y ≥ 95 % de recall sobre las relevantes.
+Para cada caso se importa el `CLAUDE.md` en una memoria **nueva y en RAM**, con reloj fijo, sin tocar el `.cthg/` del proyecto ni llamar a git. Así el resultado es determinista. Seis configuraciones, todas con los presupuestos reales (500 / 800 / 300):
+
+| Configuración | Qué inyecta |
+|---|---|
+| `completo` | el archivo entero (recall 100 % por definición) |
+| `anidado ideal` | reglas sin ruta + reglas cuya ruta es antecesora de lo tocado o leído, sin presupuesto: los `CLAUDE.md` por carpeta hechos a la perfección |
+| `solo léxico` | canal 0 + canal 3 |
+| `espacial` | canal 0 + canal 1 |
+| `espacial + lectura` | canal 0 + canal 1 + canal 2 |
+| `todo` | canales 0–3 en el orden de los hooks (session-start → prompt → un read por archivo), con deduplicación de sesión |
+
+Métricas por caso y configuración: tokens inyectados (`approx_tokens` del texto renderizado), recall = relevantes inyectadas / relevantes, precisión = relevantes inyectadas / inyectadas, y críticas perdidas.
+
+Cada regla relevante **no** inyectada recibe una sola causa, la primera que aplica:
+
+1. `no importada`: el parser saltó ese bloque (o la línea no es la primera del bloque).
+2. `fusionada al importar (con Ln)`: import la juntó con otra regla parecida. Cuenta como fallo aunque la otra sí se inyecte, porque una fusión puede perder contenido (sección 14).
+3. `χ bajo`: invisible (un plan) o dudosa / descartada.
+4. `fuera de presupuesto`: sin presupuesto sí habría salido.
+5. `sin ruta y no CORE`: ningún canal puede encontrarla salvo por palabras. Solución: `CORE` o darle ruta.
+6. `ruta no coincide`: está anclada fuera de lo que se tocó o leyó.
+7. `sin coincidencia léxica`: no había rutas con las que comparar y las palabras no coinciden.
+
+### 12.2 Formato
+
+Una carpeta por repo evaluado, con el `CLAUDE.md` (o `AGENTS.md`), `casos.md` y, si el repo no está a mano, `rutas.txt` (una ruta existente por línea). Si no hay `rutas.txt`, se usa `--repo DIR` o el repo actual.
+
+```text
+core: L7, L8                         (CORE confirmado; si falta, se usan las propuestas de import)
+
+## caso: arreglar el colisionador
+prompt: arréglalo
+git: src/core/collider.rs            (modificados: canal 1)
+lee: src/core/collider.rs            (leídos: canal 2)
+relevantes: L7!, L15, L16!           (líneas del CLAUDE.md; ! = crítica; vacío = sin etiquetar)
+core: L7                             (opcional: otro CORE para este caso)
+```
+
+Las líneas se refieren al archivo gracias a `node.key = "<archivo>:L<línea>"`, que `import` rellena con la primera línea de cada bloque.
+
+Las etiquetas de un repo real las pone una persona. Un caso con `relevantes:` vacío se lista como «sin etiquetar» y no cuenta.
+
+### 12.3 Resultado del ejemplo sintético
+
+`cthg eval eval/ejemplo`: 25 bloques, 5 reglas `CORE`, 10 casos medidos (completo en [eval/ejemplo/resultado.md](eval/ejemplo/resultado.md)).
+
+| Configuración | Tokens medios | Ahorro | Recall | Precisión | Críticas perdidas |
+|---|---:|---:|---:|---:|---:|
+| completo | 491 | 0 % | 100 % | 17 % | 0 |
+| anidado ideal | 183 | 63 % | 97 % | 42 % | 1 |
+| solo léxico | 136 | 72 % | 74 % | 50 % | 4 |
+| espacial | 124 | 75 % | 73 % | 54 % | 3 |
+| espacial + lectura | 152 | 69 % | 93 % | 59 % | 1 |
+| todo | 171 | 65 % | 93 % | 56 % | 1 |
+
+Cómo leerlo:
+
+- **El canal justo a tiempo es el que más aporta**: el recall pasa de 73 % (`espacial`) a 93 % (`+ lectura`). Sin él, todo caso cuyo archivo no está modificado todavía («añade un mensaje al protocolo») se pierde.
+- **El léxico solo, no basta** (74 %): «arréglalo» no nombra nada. Lo que sí aporta en `todo` son las preguntas sin archivo.
+- **No cumple el criterio** en este ejemplo, por dos motivos concretos:
+  - Todos los fallos de `todo` están en «desplegar»: «despliego» no coincide con «despliegue» (el stemming es demasiado ligero) y «avisa en el canal de operaciones» no tiene ruta ni es `CORE`. Son exactamente los huecos de la sección 5, ahora medidos.
+  - El ahorro (65 %) está limitado por el tamaño: con un `CLAUDE.md` de 491 tokens, el núcleo fijo (~100 tokens) pesa mucho. En un archivo real de miles de tokens el coste del núcleo es el mismo y el ahorro crece; hay que confirmarlo con repos reales.
+- **`anidado ideal` es la línea base a batir**: aquí iguala a `todo` en recall con menos tokens, porque es perfecto por construcción (sabe de antemano qué archivos se tocarán). Lo que 3D-Memory añade sobre él son χ, causas, tiempo y ramas, no recall puro.
+
+### 12.4 Siguientes mediciones
+
+1. Uno o dos repos reales con un `CLAUDE.md` largo, 15–30 casos de sesiones pasadas, etiquetados a mano.
+2. No cambiar constantes para mejorar los números del mismo conjunto: si hay que ajustar, separar casos de ajuste y de prueba.
+
+Criterio de éxito: ≥ 70 % menos tokens que `completo`, **cero** críticas perdidas y ≥ 95 % de recall en `todo`. Si no se cumple, el entregable es la lista de fallos con su diagnóstico.
 
 ---
 
@@ -461,7 +527,7 @@ Criterio de éxito propuesto: ≥ 70 % menos tokens que el `CLAUDE.md` completo,
 | 3 | Canal espacial completo: símbolos desde los hunks de `git diff`, renombres automáticos (`-M`), ranking de rutas por tamaño del diff | ✅ (16 tests) |
 | 4 | `cthg hook` + deduplicación por sesión + instalar en un proyecto de prueba | ✅ (18 tests) |
 | 5 | `verify` (anclar y desanclar contra el repo), más arreglos: símbolo del método editado, aviso de núcleo desbordado, renombres solo en el tronco, candado de escritura, `core --unset` | ✅ (27 tests) |
-| 6 | Medición (sección 12) | pendiente |
+| 6 | `cthg eval` + conjunto sintético (sección 12); falta medir repos reales | ✅ (32 tests) |
 | 7 | Ramas fusionadas visibles en el tronco, `gc`, visor 3D | pendiente |
 
 ---
@@ -469,6 +535,7 @@ Criterio de éxito propuesto: ≥ 70 % menos tokens que el `CLAUDE.md` completo,
 ## 14. Riesgos abiertos
 
 - **Clasificar `CORE`** es el punto único de fallo restante. Mitigación: `import` propone, el usuario confirma, `core`/`list`/`import`/`session-start` avisan si el núcleo no cabe, y la medición lista cada fallo.
+- **Stemming demasiado ligero**: «despliego» no coincide con «despliegue» ni con «desplegar» (medido en `eval/ejemplo`, caso «desplegar»). Opciones: alias por regla, o un stemmer español algo más fuerte; decidirlo con datos de repos reales.
 - **Reformulaciones que cambian una palabra clave**: «depende del crate tokio» se toma como repetición de «depende del crate serde» (similitud 0,75 ≥ 0,5) y refuerza el recuerdo equivocado; lo mismo pasa con `git status` y `git status && git push`. Pendiente: exigir que las palabras que no comparten no sean nombres propios, identificadores o rutas, o subir el umbral cuando la frase es corta.
 - **Ruido espacial** en árboles sucios. Mitigación: ruido, ranking por tamaño del diff, máximo de rutas, pesos, presupuesto.
 - **Reglas del usuario empiezan en «probable» (0,30)**, no en «verificado». Es intencionado (una sola afirmación no es prueba), pero si en la medición eso hace que se ignoren, se sube el prior de `usuario`.

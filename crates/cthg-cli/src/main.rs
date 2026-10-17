@@ -9,7 +9,7 @@ use cthg_core::retrieve::{self, Query};
 use cthg_core::score::{self, certainty_tag, View};
 use cthg_core::spatial::{self, Target};
 use cthg_core::verify::{self, RepoProbe, VerifyAction};
-use cthg_core::{binary, hook, import, text};
+use cthg_core::{binary, eval, hook, import, text};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -43,6 +43,7 @@ const HELP: &str = "cthg — memoria de proyecto (ruta · tiempo · confianza)
   cthg import <archivo.md> [--yes]
   cthg hook <session-start|prompt|read|edit>
   cthg verify [--run-commands]
+  cthg eval <carpeta> [--markdown] [--repo DIR] [--file CLAUDE.md]
 
 Pendiente: gc y view (fase 7).";
 
@@ -65,7 +66,7 @@ struct Args {
     opts: Vec<(String, Option<String>)>,
 }
 
-const FLAGS: &[&str] = &["core", "plan", "deny", "git", "all", "yes", "unset", "run-commands"];
+const FLAGS: &[&str] = &["core", "plan", "deny", "git", "all", "yes", "unset", "run-commands", "markdown"];
 
 impl Args {
     fn parse(raw: &[String]) -> Result<Self, String> {
@@ -486,7 +487,9 @@ fn run(raw: &[String]) -> Result<(), String> {
             let branch = repo.branch(&m);
             let commit = repo.commit();
             let apply_core = a.flag("yes");
-            let report = import::import_markdown(&mut m, &md, &branch, &commit, now(), apply_core, |p| {
+            // Each node remembers where it came from (`<archivo>:L<línea>`), so `eval` can refer to it.
+            let source = spatial::normalize(file_arg);
+            let report = import::import_markdown_named(&mut m, &source, &md, &branch, &commit, now(), apply_core, |p| {
                 repo.root.join(p).exists()
             });
             repo.save(&m)?;
@@ -575,6 +578,39 @@ fn run(raw: &[String]) -> Result<(), String> {
                 for (id, cmd) in &report.skipped_commands {
                     println!("  #{id:<4} {cmd}");
                 }
+            }
+        }
+        "eval" => {
+            let dir = PathBuf::from(a.pos.first().ok_or("uso: cthg eval <carpeta> [--markdown] [--repo DIR] [--file CLAUDE.md]")?);
+            let name = match a.get("file") {
+                Some(f) => f.to_string(),
+                None => ["CLAUDE.md", "AGENTS.md"]
+                    .into_iter()
+                    .find(|f| dir.join(f).is_file())
+                    .ok_or(format!("no hay CLAUDE.md ni AGENTS.md en {}", dir.display()))?
+                    .to_string(),
+            };
+            let md = fs::read_to_string(dir.join(&name)).map_err(|e| format!("{name}: {e}"))?;
+            let casos = fs::read_to_string(dir.join("casos.md")).map_err(|e| format!("casos.md: {e}"))?;
+            let file = eval::parse_cases(&casos).map_err(|e| format!("casos.md, {e}"))?;
+            // Which paths exist decides which rules get a place in the tree: from --repo, from
+            // `rutas.txt` (one path per line) or from the current repository.
+            let listed: Option<Vec<String>> = fs::read_to_string(dir.join("rutas.txt"))
+                .ok()
+                .map(|t| t.lines().map(spatial::normalize).filter(|p| !p.is_empty() && !p.starts_with('#')).collect());
+            let root = a.get("repo").map(PathBuf::from).unwrap_or_else(|| repo.root.clone());
+            let exists = |p: &str| match (&listed, a.get("repo")) {
+                (Some(paths), None) => paths.iter().any(|x| spatial::is_ancestor_or_self(p, x)),
+                _ => root.join(p).exists(),
+            };
+            let report = eval::run(&name, &md, &file, &exists);
+            let out = eval::render_markdown(&report, &dir.display().to_string());
+            print!("{out}");
+            if a.flag("markdown") {
+                let path = dir.join("resultado.md");
+                fs::write(&path, &out).map_err(|e| format!("{}: {e}", path.display()))?;
+                println!("
+escrito: {}", path.display());
             }
         }
         "gc" | "view" => {

@@ -5,6 +5,7 @@
 //! - Z: how far to trust it — χ in [−1, 1], computed from structure and evidence (`score`).
 
 pub mod binary;
+pub mod eval;
 pub mod hook;
 pub mod import;
 pub mod learn;

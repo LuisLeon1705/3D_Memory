@@ -16,6 +16,8 @@ use super::text;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportItem {
+    /// 1-indexed line number of the first line of the Markdown block.
+    pub line: usize,
     pub text: String,
     pub kind: NodeKind,
     pub path: String,
@@ -29,6 +31,8 @@ pub struct ImportReport {
     pub added: Vec<u32>,
     /// Existing node IDs that matched an imported item (not duplicated).
     pub existing: Vec<u32>,
+    /// `(line, merged_into_node_id)` for items that `find_existing` merged into another node.
+    pub merged: Vec<(usize, u32)>,
     /// Pathless general rules proposed for `CORE` (when `apply_core` is false).
     pub proposed_core: Vec<u32>,
     /// Node IDs marked as `CORE` during this import (when `apply_core` is true).
@@ -78,7 +82,7 @@ const NORMATIVE_PHRASES: &[&str] = &[
 pub fn parse_markdown(md: &str, exists: impl Fn(&str) -> bool) -> Vec<ImportItem> {
     let raw_blocks = split_blocks(md);
     let mut out: Vec<ImportItem> = Vec::new();
-    for (raw, is_bullet) in raw_blocks {
+    for (line, raw, is_bullet) in raw_blocks {
         let (path, symbol) = extract_location(&raw, &exists);
         let cleaned = clean_markdown(&raw);
         let toks = text::tokens(&cleaned);
@@ -91,21 +95,37 @@ pub fn parse_markdown(md: &str, exists: impl Fn(&str) -> bool) -> Vec<ImportItem
         }
         let kind = classify_kind(&raw, &cleaned, is_bullet);
         let propose_core = is_core_candidate(&cleaned, &path, kind);
-        if out
-            .iter()
-            .any(|prev| prev.path == path && text::similarity(&toks, &text::tokens(&prev.text)) >= 0.85)
-        {
-            continue;
-        }
-        out.push(ImportItem { text: cleaned, kind, path, symbol, propose_core });
+        out.push(ImportItem {
+            line,
+            text: cleaned,
+            kind,
+            path,
+            symbol,
+            propose_core,
+        });
     }
     out
 }
 
-/// Imports a Markdown document into `m`. When `apply_core` is false, `CORE` candidates are only
-/// reported in `proposed_core`; when true, they receive `flags::CORE`.
+/// Imports a Markdown document into `m` using `"CLAUDE.md"` as the default source filename for `node.key`.
 pub fn import_markdown(
     m: &mut Memory,
+    md: &str,
+    branch: &str,
+    commit: &str,
+    now: f64,
+    apply_core: bool,
+    exists: impl Fn(&str) -> bool,
+) -> ImportReport {
+    import_markdown_named(m, "CLAUDE.md", md, branch, commit, now, apply_core, exists)
+}
+
+/// Imports a Markdown document into `m`, stamping each new node's `key` with `"<source>:L<line>"`.
+/// Re-importing the same file preserves existing `node.key` values.
+#[allow(clippy::too_many_arguments)]
+pub fn import_markdown_named(
+    m: &mut Memory,
+    source: &str,
     md: &str,
     branch: &str,
     commit: &str,
@@ -119,10 +139,16 @@ pub fn import_markdown(
     let mut report = ImportReport::default();
 
     for item in items {
+        let item_key = format!("{source}:L{}", item.line);
         let toks = text::tokens(&item.text);
         if let Some(id) = find_existing(m, &scores, &toks, &item.path) {
             if !report.added.contains(&id) && !report.existing.contains(&id) {
                 report.existing.push(id);
+            }
+            if m.nodes[id as usize].key.is_empty() {
+                m.nodes[id as usize].key = item_key;
+            } else if m.nodes[id as usize].key != item_key {
+                report.merged.push((item.line, id));
             }
             if m.nodes[id as usize].path.is_empty() && !item.path.is_empty() {
                 m.nodes[id as usize].path = item.path.clone();
@@ -165,7 +191,7 @@ pub fn import_markdown(
             activation: 1.0,
             recalls: 0,
             created_session: m.session,
-            key: String::new(),
+            key: item_key,
             label: text::clip(&item.text, 64),
             text: text::clip(&item.text, 600),
             aliases: vec![],
@@ -205,27 +231,29 @@ fn paths_compatible(a: &str, b: &str) -> bool {
     spatial::is_ancestor_or_self(a, b) || spatial::is_ancestor_or_self(b, a)
 }
 
-/// Splits Markdown into `(raw_block, is_bullet)` items, skipping code fences, headings and tables.
-fn split_blocks(md: &str) -> Vec<(String, bool)> {
+/// Splits Markdown into `(start_line_1_indexed, raw_block, is_bullet)` items, skipping code fences, headings and tables.
+fn split_blocks(md: &str) -> Vec<(usize, String, bool)> {
     let md = md.strip_prefix('\u{feff}').unwrap_or(md);
     let mut blocks = Vec::new();
     let mut cur = String::new();
+    let mut cur_line = 1usize;
     let mut cur_bullet = false;
     let mut in_fence = false;
 
-    let flush = |blocks: &mut Vec<(String, bool)>, cur: &mut String, cur_bullet: &mut bool| {
+    let flush = |blocks: &mut Vec<(usize, String, bool)>, cur: &mut String, cur_line: usize, cur_bullet: &mut bool| {
         let s = cur.trim();
         if !s.is_empty() {
-            blocks.push((s.to_string(), *cur_bullet));
+            blocks.push((cur_line, s.to_string(), *cur_bullet));
         }
         cur.clear();
         *cur_bullet = false;
     };
 
-    for line in md.lines() {
+    for (idx, line) in md.lines().enumerate() {
+        let line_no = idx + 1;
         let trimmed_start = line.trim_start_matches([' ', '\t', '\u{feff}']);
         if trimmed_start.starts_with("```") || trimmed_start.starts_with("~~~") {
-            flush(&mut blocks, &mut cur, &mut cur_bullet);
+            flush(&mut blocks, &mut cur, cur_line, &mut cur_bullet);
             in_fence = !in_fence;
             continue;
         }
@@ -240,23 +268,25 @@ fn split_blocks(md: &str) -> Vec<(String, bool)> {
             || is_html_tag(trimmed)
             || trimmed.starts_with("> [!")
         {
-            flush(&mut blocks, &mut cur, &mut cur_bullet);
+            flush(&mut blocks, &mut cur, cur_line, &mut cur_bullet);
             continue;
         }
         let content = trimmed.strip_prefix("> ").unwrap_or(trimmed).trim_start();
         if let Some(item) = strip_bullet(content) {
-            flush(&mut blocks, &mut cur, &mut cur_bullet);
+            flush(&mut blocks, &mut cur, cur_line, &mut cur_bullet);
             cur.push_str(item);
+            cur_line = line_no;
             cur_bullet = true;
         } else if !cur.is_empty() {
             cur.push(' ');
             cur.push_str(content);
         } else {
             cur.push_str(content);
+            cur_line = line_no;
             cur_bullet = false;
         }
     }
-    flush(&mut blocks, &mut cur, &mut cur_bullet);
+    flush(&mut blocks, &mut cur, cur_line, &mut cur_bullet);
     blocks
 }
 
@@ -608,5 +638,31 @@ cargo test
             assert!(m.nodes[id as usize].has(flags::CORE));
             assert!(m.nodes[id as usize].path.is_empty());
         }
+    }
+
+    #[test]
+    fn importing_twice_preserves_node_keys() {
+        let mut m = Memory::default();
+        let r1 = import_markdown_named(&mut m, "CLAUDE.md", SAMPLE_MD, "", "a1b2c3d", 1000.0, false, repo_exists);
+        assert_eq!(r1.added.len(), 7);
+        let keys_first: Vec<String> = m.nodes.iter().map(|n| n.key.clone()).collect();
+        assert_eq!(
+            keys_first,
+            vec![
+                "CLAUDE.md:L3",
+                "CLAUDE.md:L11",
+                "CLAUDE.md:L12",
+                "CLAUDE.md:L13",
+                "CLAUDE.md:L14",
+                "CLAUDE.md:L15",
+                "CLAUDE.md:L16",
+            ]
+        );
+
+        // Re-importing the exact same file keeps the exact same keys and reports zero merges.
+        let r2 = import_markdown_named(&mut m, "CLAUDE.md", SAMPLE_MD, "", "a1b2c3d", 1005.0, true, repo_exists);
+        let keys_second: Vec<String> = m.nodes.iter().map(|n| n.key.clone()).collect();
+        assert_eq!(keys_first, keys_second);
+        assert!(r2.merged.is_empty());
     }
 }
