@@ -4,7 +4,7 @@ Memoria de proyecto para agentes de código (Claude Code primero). Objetivo: sus
 
 Motor: **CTHG** (*Causal-Temporal HyperGraph*): un grafo de recuerdos en un archivo binario, con tres ejes.
 
-Estado: `cthg-core` completo y probado (14 tests); CLI con `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list`, `mv` e `import`. Faltan los hooks, `verify` y la medición (ver [Fases](#13-fases)).
+Estado: `cthg-core` completo y probado (16 tests); CLI con `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list`, `mv` e `import`. Faltan los hooks, `verify` y la medición (ver [Fases](#13-fases)).
 
 ---
 
@@ -65,7 +65,7 @@ Consecuencias:
 
 - Una regla del archivo exacto vale 1; la de su carpeta 0,8; la de la carpeta de encima 0,64. **Herencia**: una regla puesta en `src/core/` aplica a todo lo que cuelga de ahí, y lo más concreto pesa más.
 - La raíz (`""`) tiene afinidad 0 con todo: **una regla sin lugar en el árbol nunca se recupera por ruta**. Por eso las reglas transversales tienen que ser `CORE`.
-- **Renombres**: si `src/core` pasa a `src/physics`, todos los nodos con `src/core ⪯ path` se reescriben (`cthg mv`, y en el futuro automático con `git diff -M`).
+- **Renombres**: si `src/core` pasa a `src/physics`, todos los nodos con `src/core ⪯ path` se reescriben (`cthg mv`, y automático con `git diff -M`).
 
 ### 3.2 Y — el tiempo, solo hacia delante
 
@@ -167,7 +167,7 @@ Tras la pasada principal se aplican dos correcciones, porque apuntan hacia delan
 | Canal | Cuándo | Entrada | Qué cubre |
 |---|---|---|---|
 | **0 · núcleo** | al iniciar la sesión | nodos `CORE` visibles | reglas transversales sin lugar en el árbol |
-| **1 · espacial (prompt)** | con cada mensaje | `git status` (y en fase 3, símbolos de los hunks de `git diff`) | lo que ya se está tocando |
+| **1 · espacial (prompt)** | con cada mensaje | `git status` y símbolos de los hunks de `git diff` | lo que ya se está tocando |
 | **2 · espacial (justo a tiempo)** | cuando el agente **lee** un archivo | esa ruta | lo que se va a tocar: llega antes de cualquier edición, porque editar exige leer antes |
 | **3 · léxico** | con cada mensaje | el texto del prompt | preguntas de intención sin archivo («¿cómo despliego?») |
 
@@ -192,7 +192,7 @@ peso = 1,0  archivo recién leído o pasado con --path
        0,5  sin seguimiento (??)
 ```
 
-Se descartan los lockfiles y `target/`, `node_modules/`, `dist/`, `build/`, `.cthg/`, y como mucho 12 rutas de `git status`.
+Se descartan los lockfiles y `target/`, `node_modules/`, `dist/`, `build/`, `.cthg/`, se ordenan por peso y tamaño del diff (`git diff -M -U0`) con sus símbolos tocados (`@@`), y se toman como mucho 12 rutas.
 
 **Fusión**:
 
@@ -269,8 +269,8 @@ Entrar por la ruta es la pieza más importante: es determinista y no depende de 
 |---|---|---|
 | El archivo aún no se ha tocado | «añade un endpoint de pagos» con `git status` limpio | **canal 2**: inyectar al leer el archivo |
 | Reglas sin lugar en el árbol | «nunca hagas push a main», «comentarios en inglés» | **`CORE`** (la raíz tiene afinidad 0 a propósito) |
-| Árbol de trabajo sucio | lockfiles, generados, veinte archivos a medias | lista de ruido, máximo de rutas, pesos, presupuesto |
-| Renombres | `src/core/` pasa a `src/physics/` | `cthg mv`; automático con `git diff -M` (fase 3) |
+| Árbol de trabajo sucio | lockfiles, generados, veinte archivos a medias | lista de ruido, ranking por diff, máximo de rutas, pesos, presupuesto |
+| Renombres | `src/core/` pasa a `src/physics/` | `cthg mv`; automático con `git diff -M` |
 | Reglas de carpeta | aplica a todo `src/core/` | herencia λ^d |
 | Funciones concretas | la regla es de `resolve_contacts`, no del archivo | X fino por símbolo (σ) |
 | Preguntas sin archivo | «¿cómo despliego?» | **canal 3** léxico, con alias |
@@ -362,7 +362,7 @@ En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`) y, e
 | `cthg learn <texto> [--kind K] [--path P] [--symbol S] [--cause T] [--cause-id N] [--contradicts N] [--supersedes N] [--origin O] [--core] [--plan] [--deny]` | ✅ | sección 6 |
 | `cthg confirm N` / `cthg deny N` | ✅ | α + 1 / β + 1 (lo anclado no se mueve) |
 | `cthg core [<id>…] [--budget N]` | ✅ | canal 0 (o marca nodos existentes como `CORE`) |
-| `cthg recall [--prompt T] [--path P]… [--git] [--budget N] [--limit N]` | ✅ | canales 1–3 (símbolos de diff: fase 3) |
+| `cthg recall [--prompt T] [--path P]… [--git] [--budget N] [--limit N]` | ✅ | canales 1–3 (rutas, símbolos de `git diff`, renombres `-M`) |
 | `cthg list [--all]` | ✅ | todos los nodos con χ, flags y rama |
 | `cthg mv <de> <a>` | ✅ | la memoria sigue a un archivo o carpeta movidos |
 | `cthg import <archivo.md> [--yes]` | ✅ | parte el archivo en nodos, deduce rutas existentes y propone cuáles son `CORE` |
@@ -416,7 +416,7 @@ Criterio de éxito propuesto: ≥ 70 % menos tokens que el `CLAUDE.md` completo,
 | 0 | Esta guía | ✅ |
 | 1 | `cthg-core` + `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list`, `mv` | ✅ (12 tests) |
 | 2 | `import CLAUDE.md` | ✅ (14 tests) |
-| 3 | Canal espacial completo: símbolos desde los hunks de `git diff`, renombres automáticos (`-M`), ranking de rutas por tamaño del diff | pendiente |
+| 3 | Canal espacial completo: símbolos desde los hunks de `git diff`, renombres automáticos (`-M`), ranking de rutas por tamaño del diff | ✅ (16 tests) |
 | 4 | `cthg hook` + deduplicación por sesión + instalar en un proyecto de prueba | pendiente |
 | 5 | `verify` (anclar y desanclar contra el repo) | pendiente |
 | 6 | Medición (sección 12) | pendiente |
@@ -427,6 +427,6 @@ Criterio de éxito propuesto: ≥ 70 % menos tokens que el `CLAUDE.md` completo,
 ## 14. Riesgos abiertos
 
 - **Clasificar `CORE`** es el punto único de fallo restante. Mitigación: `import` propone, el usuario confirma, la medición lista cada fallo.
-- **Ruido espacial** en árboles sucios. Mitigación: ruido, máximo de rutas, pesos, presupuesto; en fase 3, ranking por tamaño del diff.
+- **Ruido espacial** en árboles sucios. Mitigación: ruido, ranking por tamaño del diff, máximo de rutas, pesos, presupuesto.
 - **Reglas del usuario empiezan en «probable» (0,30)**, no en «verificado». Es intencionado (una sola afirmación no es prueba), pero si en la medición eso hace que se ignoren, se sube el prior de `usuario`.
 - **Versionar `.cthg/` o no**: compartirlo con el equipo frente a mezclar correcciones personales. Se decide por proyecto.

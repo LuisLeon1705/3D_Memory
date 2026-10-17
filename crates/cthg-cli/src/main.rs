@@ -139,23 +139,19 @@ impl Repo {
     fn commit(&self) -> String {
         git(&self.root, &["rev-parse", "--short", "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default()
     }
-    /// Paths with pending changes, as spatial targets. Noise and overflow are dropped.
-    fn git_targets(&self) -> Vec<Target> {
-        let Some(out) = git(&self.root, &["status", "--porcelain=v1"]) else { return vec![] };
-        let mut ts = Vec::new();
-        for line in out.lines().filter(|l| l.len() > 3) {
-            let (code, rest) = line.split_at(3);
-            let path = rest.rsplit(" -> ").next().unwrap_or(rest).trim_matches('"');
-            let path = spatial::normalize(path);
-            let name = path.rsplit('/').next().unwrap_or(&path);
-            if NOISE.contains(&name) || NOISE_DIRS.iter().any(|d| path.starts_with(d) || path.contains(&format!("/{d}"))) {
-                continue;
-            }
-            let weight = if code.starts_with("??") { 0.5 } else { 0.8 };
-            ts.push(Target::new(&path, weight));
-        }
-        ts.truncate(MAX_GIT_PATHS);
-        ts
+    /// Applies any `git diff -M` / `git status` renames to `m` and returns ranked spatial targets
+    /// with touched symbols from diff hunk headers.
+    fn sync_git_and_targets(&self, m: &mut Memory) -> (Vec<Target>, usize) {
+        let status = git(&self.root, &["status", "--porcelain=v1"]).unwrap_or_default();
+        let diff = git(&self.root, &["diff", "-M", "-U0", "HEAD"]).unwrap_or_else(|| {
+            let staged = git(&self.root, &["diff", "-M", "-U0", "--cached"]).unwrap_or_default();
+            let unstaged = git(&self.root, &["diff", "-M", "-U0"]).unwrap_or_default();
+            format!("{staged}\n{unstaged}")
+        });
+        let renames = spatial::parse_renames(&status, &diff);
+        let moved = spatial::apply_renames(m, &renames, |p| self.root.join(p).exists());
+        let targets = spatial::rank_git_targets(&status, &diff, NOISE, NOISE_DIRS, MAX_GIT_PATHS);
+        (targets, moved)
     }
 }
 
@@ -307,16 +303,24 @@ fn run(raw: &[String]) -> Result<(), String> {
             }
         }
         "recall" => {
-            let m = repo.load()?;
-            let scores = score::score_all(&m, &view(&repo, &m));
+            let mut m = repo.load()?;
             let mut targets: Vec<Target> = a.all("path").iter().map(|p| Target::new(p, 1.0)).collect();
             if a.flag("git") {
-                for t in repo.git_targets() {
-                    if !targets.iter().any(|x| x.path == t.path) {
+                let (git_ts, moved) = repo.sync_git_and_targets(&mut m);
+                if moved > 0 {
+                    repo.save(&m)?;
+                }
+                for t in git_ts {
+                    if let Some(existing) = targets.iter_mut().find(|x| x.path == t.path) {
+                        if existing.symbols.is_empty() {
+                            existing.symbols = t.symbols;
+                        }
+                    } else {
                         targets.push(t);
                     }
                 }
             }
+            let scores = score::score_all(&m, &view(&repo, &m));
             let q = Query { text: a.get("prompt").unwrap_or("").to_string(), targets };
             let limit = a.num("limit")?.unwrap_or(40);
             let budget = a.num("budget")?.unwrap_or(800);
