@@ -1,0 +1,12 @@
+[package]
+name = "cthg-cli"
+version.workspace = true
+edition.workspace = true
+description = "CLI `cthg`: recuerda y aprende la memoria de un repositorio"
+
+[[bin]]
+name = "cthg"
+path = "src/main.rs"
+
+[dependencies]
+cthg-core = { path = "../cthg-core" }

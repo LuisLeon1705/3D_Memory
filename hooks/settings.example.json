@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "cthg hook session-start" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "cthg hook prompt" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Read", "hooks": [{ "type": "command", "command": "cthg hook read" }] },
+      { "matcher": "Edit|MultiEdit|Write", "hooks": [{ "type": "command", "command": "cthg hook edit" }] }
+    ]
+  }
+}

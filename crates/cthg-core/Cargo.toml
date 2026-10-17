@@ -1,0 +1,7 @@
+[package]
+name = "cthg-core"
+version.workspace = true
+edition.workspace = true
+description = "CTHG: memoria de proyecto en 3D (ruta, tiempo, confianza) en formato binario"
+
+[dependencies]
