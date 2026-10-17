@@ -5,8 +5,6 @@ description: Write to this repository's CTHG memory (`cthg`) when the user corre
 
 # Memoria del proyecto (`cthg`)
 
-En este repo `cthg` no está en el PATH: usa `C:/Users/leonp/OneDrive/Escritorio/3D-Memory/target/release/cthg.exe` donde abajo pone `cthg`.
-
 Los hooks ya te inyectan lo relevante (núcleo, reglas del archivo que lees, reglas de lo que cambió). Esta skill es para **escribir**.
 
 ## Cuándo escribir
@@ -15,6 +13,7 @@ Los hooks ya te inyectan lo relevante (núcleo, reglas del archivo que lees, reg
 |---|---|
 | El usuario te corrige («aquí no uses unwrap») | `cthg learn "<regla en una frase>" --path <archivo o carpeta> --cause "<por qué, si lo dijo>"` |
 | La regla aplica a todo el proyecto, sin lugar en el árbol | añade `--core` (si no, nunca se recuperará por ruta) |
+| La regla vale para **todos** los proyectos del usuario (no solo este) | `cthg learn --global --core "<regla>"` (sin `--path`): va a la memoria global y se inyecta en cada sesión de cualquier proyecto |
 | Contradice una regla que te inyectaron (`#N`) | `cthg learn "<nueva>" --supersedes N` |
 | El usuario confirma algo marcado `dudoso` / `sin evidencia` | `cthg confirm N` |
 | El usuario dice que algo inyectado es falso | `cthg deny N` |

@@ -4,6 +4,14 @@
 
 Todos los hooks llaman al mismo binario; los scripts no tienen lógica, así funcionan igual en Windows y en Unix.
 
+Los hooks llaman a `cthg` por su nombre, sin rutas fijas. Para eso tiene que estar en el PATH:
+
+```bash
+cargo install --path crates/cthg-cli --locked
+```
+
+Eso lo deja en `~/.cargo/bin`. Después de cambiar el código de `cthg`, repite la instalación: los hooks de todos los proyectos usan ese binario.
+
 | Evento | Subcomando | Lee de stdin (JSON) | Escribe |
 |---|---|---|---|
 | `SessionStart` | `cthg hook session-start` | `session_id`, `cwd` | Canal 0 (núcleo). Arranca la sesión: olvido (decaimiento de activación) |

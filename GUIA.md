@@ -4,7 +4,7 @@ Memoria de proyecto para agentes de código (Claude Code primero). Objetivo: sus
 
 Motor: **CTHG** (*Causal-Temporal HyperGraph*): un grafo de recuerdos en un archivo binario, con tres ejes.
 
-Estado: `cthg-core` completo y probado (40 tests); CLI con `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list`, `mv`, `import`, `hook`, `verify` y `eval`. Falta la medición sobre repos reales y la fase 7 (ver [Fases](#13-fases)).
+Estado: `cthg-core` completo y probado (41 tests, más 1 del CLI); CLI con `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list`, `mv`, `import`, `hook`, `verify` y `eval`. Falta la medición sobre repos reales y la fase 7 (ver [Fases](#13-fases)).
 
 ---
 
@@ -167,7 +167,7 @@ Tras la pasada principal se aplican dos correcciones, porque apuntan hacia delan
 
 | Canal | Cuándo | Entrada | Qué cubre |
 |---|---|---|---|
-| **0 · núcleo** | al iniciar la sesión | nodos `CORE` visibles | reglas transversales sin lugar en el árbol |
+| **0 · núcleo** | al iniciar la sesión | `CORE` global (todos los proyectos) y luego el del proyecto | reglas transversales sin lugar en el árbol |
 | **1 · espacial (prompt)** | con cada mensaje | `git status` y símbolos de los hunks de `git diff` | lo que ya se está tocando |
 | **2 · espacial (justo a tiempo)** | cuando el agente **lee** un archivo | esa ruta | lo que se va a tocar: llega antes de cualquier edición, porque editar exige leer antes |
 | **3 · léxico** | con cada mensaje | el texto del prompt | preguntas de intención sin archivo («¿cómo despliego?») |
@@ -419,6 +419,14 @@ Ejemplo con números (prior de `importado` (5; 1,5) → A = 0,54; e = 4,5 → w 
 └─ docs/formato-cthg.md       especificación byte a byte
 ```
 
+### 8.1 Memoria global
+
+Las reglas que valen para **todos** los proyectos del usuario viven en una memoria aparte: `~/.cthg/global.cthg` (o la ruta de `CTHG_GLOBAL`). Se edita con `--global` en `init`, `learn`, `confirm`, `deny`, `core`, `list` e `import`; no tiene rutas ni ramas, y `recall`, `verify`, `mv` y `eval` no aplican.
+
+En `session-start` va primero el `CORE` global y después el del proyecto, compartiendo los 500 tokens: el proyecto usa lo que deja el global. Una regla `CORE` del proyecto que repite una global (similitud ≥ 0,5) no se inyecta dos veces. Los ids globales se escriben `#g3`. `import` propone el `CORE` del proyecto dentro de lo que deja el global, y `core`/`list` avisan si no cabe.
+
+Un proyecto se reconoce por `.cthg/memoria.cthg`, no por la carpeta `.cthg/` sola: `~/.cthg/` es antecesora de todos los proyectos y nunca debe tomarse por uno.
+
 En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`), `<repo>/.cthg/sesion/<session_id>.json` para no repetir lo ya inyectado y `<repo>/.cthg/lock` mientras alguien la modifica. Si se versiona `.cthg/` o no se decide por proyecto (sección 14).
 
 ---
@@ -430,7 +438,8 @@ En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`), `<r
 | `cthg init` | ✅ | crea `.cthg/memoria.cthg` en la raíz git; detecta el tronco |
 | `cthg learn <texto> [--kind K] [--path P] [--symbol S] [--cause T] [--cause-id N] [--contradicts N] [--supersedes N] [--origin O] [--core] [--plan] [--deny]` | ✅ | sección 6 |
 | `cthg confirm N` / `cthg deny N` | ✅ | α + 1 / β + 1 (lo anclado no se mueve) |
-| `cthg core [<id>… [--unset]] [--budget N]` | ✅ | canal 0; con ids, marca o desmarca `CORE`. Avisa si el núcleo no cabe en el presupuesto |
+| `cthg core [<id>… [--unset]] [--budget N]` | ✅ | canal 0 tal como se inyecta (global y proyecto); con ids, marca o desmarca `CORE`. Avisa si el núcleo no cabe en el presupuesto |
+| `cthg <init\|learn\|confirm\|deny\|core\|list\|import> --global` | ✅ | lo mismo sobre la memoria global (sección 8.1) |
 | `cthg recall [--prompt T] [--path P]… [--git] [--budget N] [--limit N]` | ✅ | canales 1–3 (rutas, símbolos de `git diff`, renombres `-M`) |
 | `cthg list [--all]` | ✅ | todos los nodos con χ, flags (incluido `obsoleto`) y rama |
 | `cthg mv <de> <a>` | ✅ | la memoria sigue a un archivo o carpeta movidos |
@@ -446,12 +455,12 @@ En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`), `<r
 
 | Evento | Comando | Canal |
 |---|---|---|
-| `SessionStart` | `cthg hook session-start` | 0, y un paso de olvido |
+| `SessionStart` | `cthg hook session-start` | 0 (global y proyecto), y un paso de olvido |
 | `UserPromptSubmit` | `cthg hook prompt` | 1 + 3 |
 | `PostToolUse` (`Read`) | `cthg hook read` | 2 (`hookSpecificOutput.additionalContext`) |
 | `PostToolUse` (`Edit\|MultiEdit\|Write`) | `cthg hook edit` | sube la activación de esa zona |
 
-Plantilla y reglas en [hooks/](hooks/README.md). En resumen: nunca bloquear (si falla, código 0 y sin salida), no repetir dentro de una sesión y respetar el presupuesto (500 / 800 / 300 tokens). Si la memoria está bloqueada por otro proceso más de 1,5 s, el hook responde igual pero no guarda. Si el núcleo no cabe en 500 tokens, `session-start` lo dice en el propio contexto, en vez de recortarlo en silencio. Se instalan en el `.claude/settings.json` **del proyecto**, no en el global.
+Plantilla y reglas en [hooks/](hooks/README.md). En resumen: nunca bloquear (si falla, código 0 y sin salida), no repetir dentro de una sesión y respetar el presupuesto (500 / 800 / 300 tokens). Si la memoria está bloqueada por otro proceso más de 1,5 s, el hook responde igual pero no guarda. Si el núcleo no cabe en 500 tokens, `session-start` lo dice en el propio contexto, en vez de recortarlo en silencio. Se instalan en el `.claude/settings.json` **del proyecto**, no en el global. Llaman a `cthg` por su nombre: se instala en el PATH con `cargo install --path crates/cthg-cli --locked` (repetir tras cada cambio). Para ver la memoria, la app Memoria 3D (`memviz`, en `Memory-Handler/3D-Memory-Visualizer`) abre cualquier repo con memoria.
 
 Los `CLAUDE.md` anidados por carpeta que Claude Code ya carga son la **línea base** contra la que medir.
 

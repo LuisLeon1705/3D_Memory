@@ -43,6 +43,7 @@ const HELP: &str = "cthg — memoria de proyecto (ruta · tiempo · confianza)
   cthg import <archivo.md> [--yes]
   cthg hook <session-start|prompt|read|edit>
   cthg verify [--run-commands]
+  cthg <init|learn|confirm|deny|core|list|import> --global   (memoria de todos los proyectos)
   cthg eval <carpeta> [--markdown] [--repo DIR] [--file CLAUDE.md] [--core-auto]
 
 Pendiente: gc y view (fase 7).";
@@ -66,7 +67,7 @@ struct Args {
     opts: Vec<(String, Option<String>)>,
 }
 
-const FLAGS: &[&str] = &["core", "plan", "deny", "git", "all", "yes", "unset", "run-commands", "markdown", "core-auto"];
+const FLAGS: &[&str] = &["core", "plan", "deny", "git", "all", "yes", "unset", "run-commands", "markdown", "core-auto", "global"];
 
 impl Args {
     fn parse(raw: &[String]) -> Result<Self, String> {
@@ -106,13 +107,15 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// The nearest folder with `.cthg/`, else the git root, else the starting folder.
+/// The nearest folder with `.cthg/memoria.cthg`, else the git root, else the starting folder.
 fn find_root_from(start: Option<&Path>) -> PathBuf {
     let cwd = start
         .filter(|p| p.is_dir())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    if let Some(d) = cwd.ancestors().find(|d| d.join(DIR).is_dir()) {
+    // A project is a folder with `.cthg/memoria.cthg`, not just `.cthg/`: the global memory
+    // lives in `~/.cthg/`, an ancestor of every project, and must never be taken for one.
+    if let Some(d) = cwd.ancestors().find(|d| d.join(DIR).join(FILE).is_file()) {
         return d.to_path_buf();
     }
     git(&cwd, &["rev-parse", "--show-toplevel"])
@@ -130,6 +133,22 @@ fn now() -> f64 {
 struct Repo {
     root: PathBuf,
     file: PathBuf,
+    /// The user's memory shared by every project (`--global`): no git, no branches, no paths.
+    global: bool,
+}
+
+/// The global memory: `CTHG_GLOBAL`, else `~/.cthg/global.cthg`.
+fn global_file() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("CTHG_GLOBAL") {
+        return Some(PathBuf::from(p));
+    }
+    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok()?;
+    Some(Path::new(&home).join(DIR).join("global.cthg"))
+}
+
+/// The global memory, if it exists and reads. Hooks inject its `CORE` before the project's.
+fn load_global() -> Option<Memory> {
+    global_file().filter(|f| f.is_file()).and_then(|f| binary::load(&f).ok())
 }
 
 /// Held while the memory is being modified; dropping it releases `.cthg/lock`.
@@ -148,11 +167,17 @@ impl Repo {
     fn open_at(start: Option<&Path>) -> Self {
         let root = find_root_from(start);
         let file = root.join(DIR).join(FILE);
-        Repo { root, file }
+        Repo { root, file, global: false }
+    }
+    fn global() -> Result<Self, String> {
+        let file = global_file().ok_or("no sé dónde va la memoria global: define CTHG_GLOBAL o USERPROFILE/HOME")?;
+        let root = file.parent().map(Path::to_path_buf).unwrap_or_default();
+        Ok(Repo { root, file, global: true })
     }
     fn load(&self) -> Result<Memory, String> {
         if !self.file.exists() {
-            return Err(format!("no hay memoria en {} (usa `cthg init`)", self.root.display()));
+            let init = if self.global { "cthg init --global" } else { "cthg init" };
+            return Err(format!("no hay memoria en {} (usa `{init}`)", self.file.display()));
         }
         binary::load(&self.file).map_err(|e| e.to_string())
     }
@@ -162,7 +187,8 @@ impl Repo {
     /// Exclusive `.cthg/lock` for one load-modify-save, waiting up to `wait`. Without it two
     /// writers (a hook and `cthg learn`) can each save their own copy and one change is lost.
     fn lock(&self, wait: Duration) -> Option<Lock> {
-        let path = self.root.join(DIR).join("lock");
+        // Next to the memory file: `.cthg/lock` for a project, `~/.cthg/lock` for the global one.
+        let path = self.file.with_file_name("lock");
         let deadline = Instant::now() + wait;
         loop {
             match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
@@ -191,6 +217,9 @@ impl Repo {
     }
     /// Current branch, or "" on trunk / outside git.
     fn branch(&self, m: &Memory) -> String {
+        if self.global {
+            return String::new();
+        }
         let cur = git(&self.root, &["rev-parse", "--abbrev-ref", "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default();
         if cur.is_empty() || cur == "HEAD" || Some(cur.as_str()) == m.meta("trunk") {
             String::new()
@@ -199,6 +228,9 @@ impl Repo {
         }
     }
     fn commit(&self) -> String {
+        if self.global {
+            return String::new();
+        }
         git(&self.root, &["rev-parse", "--short", "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default()
     }
     /// Ranked spatial targets from `git status` / `git diff -M`, with the symbols that really
@@ -278,7 +310,15 @@ fn run(raw: &[String]) -> Result<(), String> {
         return Ok(());
     };
     let a = Args::parse(rest)?;
-    let repo = Repo::open();
+    let repo = if a.flag("global") { Repo::global()? } else { Repo::open() };
+    if repo.global {
+        if matches!(cmd.as_str(), "recall" | "verify" | "mv" | "eval" | "hook") {
+            return Err(format!("`{cmd}` no aplica a la memoria global: no tiene rutas ni repo"));
+        }
+        if a.get("path").is_some() || a.get("symbol").is_some() {
+            return Err("la memoria global no tiene rutas: sus reglas valen en todos los proyectos".into());
+        }
+    }
     match cmd.as_str() {
         "init" => {
             if repo.file.exists() {
@@ -286,6 +326,13 @@ fn run(raw: &[String]) -> Result<(), String> {
                 return Ok(());
             }
             let mut m = Memory::default();
+            if repo.global {
+                m.set_meta("scope", "global");
+                m.set_meta("created", &format!("{:.0}", now()));
+                repo.save(&m)?;
+                println!("memoria global creada: {}", repo.file.display());
+                return Ok(());
+            }
             let cur = git(&repo.root, &["rev-parse", "--abbrev-ref", "HEAD"]).map(|s| s.trim().to_string());
             let trunk = match cur.as_deref() {
                 Some(b @ ("main" | "master" | "trunk" | "develop")) => b.to_string(),
@@ -367,16 +414,25 @@ fn run(raw: &[String]) -> Result<(), String> {
                 for id in ids {
                     println!("{action:<12} #{:<4} {}", id, m.nodes[id as usize].label);
                 }
-                warn_core_overflow(&m, &score::score_all(&m, &view(&repo, &m)), budget);
+                warn_core_overflow(&m, &score::score_all(&m, &view(&repo, &m)), budget.saturating_sub(global_used(&repo)));
                 return Ok(());
             }
             let m = repo.load()?;
             let scores = score::score_all(&m, &view(&repo, &m));
-            let ids = retrieve::core(&m, &scores);
-            let ids = retrieve::fit_budget(&m, &ids, budget, |n| render(&m, &scores, n));
-            if !ids.is_empty() {
-                println!("## Reglas del proyecto (siempre)");
-                print_bands(&m, &scores, &ids);
+            // Exactly what session start injects: the global layer first, then this memory.
+            let (global_out, used, global_toks) = match (repo.global, load_global()) {
+                (false, Some(g)) => hook::global_core(&g, budget),
+                _ => Default::default(),
+            };
+            if !global_out.is_empty() {
+                println!("{global_out}\n");
+            }
+            let ids = project_core(&m, &scores, &global_toks);
+            let budget = budget.saturating_sub(used);
+            let shown = retrieve::fit_budget(&m, &ids, budget, |n| render(&m, &scores, n));
+            if !shown.is_empty() {
+                println!("{}", if repo.global { "## Reglas globales (siempre, en todos los proyectos)" } else { "## Reglas del proyecto (siempre)" });
+                print_bands(&m, &scores, &shown);
             }
             warn_core_overflow(&m, &scores, budget);
         }
@@ -448,7 +504,7 @@ fn run(raw: &[String]) -> Result<(), String> {
                     n.label
                 );
             }
-            warn_core_overflow(&m, &scores, hook::BUDGET_CORE);
+            warn_core_overflow(&m, &scores, hook::BUDGET_CORE.saturating_sub(global_used(&repo)));
         }
         "mv" => {
             let (mut m, _lock) = repo.load_locked()?;
@@ -473,7 +529,9 @@ fn run(raw: &[String]) -> Result<(), String> {
             let source = spatial::normalize(file_arg);
             let files = repo_files(&repo.root);
             let resolve = |p: &str| resolve_in(&files, &repo.root, p);
-            let report = import::import_markdown_named(&mut m, &source, &md, &branch, &commit, now(), apply_core, resolve);
+            // The CORE proposal fits in what the global layer leaves.
+            let core_budget = hook::BUDGET_CORE.saturating_sub(global_used(&repo));
+            let report = import::import_markdown_in(&mut m, &source, &md, &branch, &commit, now(), apply_core, core_budget, resolve);
             repo.save(&m)?;
             let scores = score::score_all(&m, &view(&repo, &m));
             let line = |action: &str, id: u32| {
@@ -544,7 +602,7 @@ fn run(raw: &[String]) -> Result<(), String> {
                     "Para confirmarlas como CORE ejecuta:\n  cthg import {file_arg} --yes\no elige cuáles marcar con:\n  cthg core <id>..."
                 );
             }
-            warn_core_overflow(&m, &scores, hook::BUDGET_CORE);
+            warn_core_overflow(&m, &scores, core_budget);
         }
         "verify" => {
             let (mut m, _lock) = repo.load_locked()?;
@@ -689,9 +747,29 @@ fn check_repo_claim(repo: &Repo, m: &mut Memory, id: u32) {
     }
 }
 
+/// Tokens the global layer takes at session start (0 for the global memory itself).
+fn global_used(repo: &Repo) -> usize {
+    if repo.global {
+        return 0;
+    }
+    load_global().map(|g| hook::global_core(&g, hook::BUDGET_CORE).1).unwrap_or(0)
+}
+
+/// This memory's `CORE`, minus the rules that repeat a global one (they are injected once).
+fn project_core(m: &Memory, scores: &[score::Score], global_toks: &[Vec<String>]) -> Vec<u32> {
+    retrieve::core(m, scores)
+        .into_iter()
+        .filter(|&id| {
+            let toks = text::tokens(&m.nodes[id as usize].text);
+            !global_toks.iter().any(|g| text::similarity(&toks, g) >= hook::DUPLICATE_OF_GLOBAL)
+        })
+        .collect()
+}
+
 /// Core rules that don't fit the session-start budget are never injected: say so, loudly.
 fn warn_core_overflow(m: &Memory, scores: &[score::Score], budget: usize) {
-    let all = retrieve::core(m, scores);
+    let global_toks = load_global().map(|g| hook::global_core(&g, hook::BUDGET_CORE).2).unwrap_or_default();
+    let all = project_core(m, scores, &global_toks);
     let kept = retrieve::fit_budget(m, &all, budget, |n| render(m, scores, n));
     if kept.len() < all.len() {
         let dropped: Vec<String> = all.iter().filter(|id| !kept.contains(id)).map(|id| format!("#{id}")).collect();
@@ -725,7 +803,8 @@ fn run_hook(rest: &[String]) -> Result<(), String> {
         "session-start" => {
             let mut session = hook::SessionState::new(&input.session_id);
             let v = view(&repo, &m);
-            let out = hook::handle_session_start(&mut m, &v, &mut session);
+            let global = load_global();
+            let out = hook::handle_session_start_layered(&mut m, &v, &mut session, global.as_ref());
             let _ = session.save(&ses_dir);
             save(&m);
             if !out.is_empty() {
@@ -765,4 +844,25 @@ fn run_hook(rest: &[String]) -> Result<(), String> {
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_global_folder_is_not_a_project() {
+        let base = std::env::temp_dir().join(format!("cthg-root-{}", std::process::id()));
+        let home = base.join("home");
+        let proj = home.join("proyecto");
+        fs::create_dir_all(home.join(DIR)).unwrap();
+        fs::write(home.join(DIR).join("global.cthg"), b"x").unwrap();
+        fs::create_dir_all(&proj).unwrap();
+        // No project memory yet: the home `.cthg/` (global only) must not be picked.
+        assert_ne!(find_root_from(Some(&proj)), home);
+        fs::create_dir_all(proj.join(DIR)).unwrap();
+        fs::write(proj.join(DIR).join(FILE), b"x").unwrap();
+        assert_eq!(find_root_from(Some(&proj.join(DIR))), proj);
+        let _ = fs::remove_dir_all(&base);
+    }
 }

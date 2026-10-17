@@ -1,14 +1,14 @@
 {
   "hooks": {
     "SessionStart": [
-      { "hooks": [{ "type": "command", "command": "C:/Users/leonp/OneDrive/Escritorio/3D-Memory/target/release/cthg.exe hook session-start" }] }
+      { "hooks": [{ "type": "command", "command": "cthg hook session-start" }] }
     ],
     "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "C:/Users/leonp/OneDrive/Escritorio/3D-Memory/target/release/cthg.exe hook prompt" }] }
+      { "hooks": [{ "type": "command", "command": "cthg hook prompt" }] }
     ],
     "PostToolUse": [
-      { "matcher": "Read", "hooks": [{ "type": "command", "command": "C:/Users/leonp/OneDrive/Escritorio/3D-Memory/target/release/cthg.exe hook read" }] },
-      { "matcher": "Edit|MultiEdit|Write", "hooks": [{ "type": "command", "command": "C:/Users/leonp/OneDrive/Escritorio/3D-Memory/target/release/cthg.exe hook edit" }] }
+      { "matcher": "Read", "hooks": [{ "type": "command", "command": "cthg hook read" }] },
+      { "matcher": "Edit|MultiEdit|Write", "hooks": [{ "type": "command", "command": "cthg hook edit" }] }
     ]
   }
 }

@@ -295,6 +295,23 @@ pub fn import_markdown_named(
     apply_core: bool,
     resolve: impl Fn(&str) -> Option<String>,
 ) -> ImportReport {
+    import_markdown_in(m, source, md, branch, commit, now, apply_core, BUDGET_CORE, resolve)
+}
+
+/// Like `import_markdown_named`, with the `CORE` proposal limited to `core_budget` tokens (what
+/// the global layer leaves at session start).
+#[allow(clippy::too_many_arguments)]
+pub fn import_markdown_in(
+    m: &mut Memory,
+    source: &str,
+    md: &str,
+    branch: &str,
+    commit: &str,
+    now: f64,
+    apply_core: bool,
+    core_budget: usize,
+    resolve: impl Fn(&str) -> Option<String>,
+) -> ImportReport {
     let mut items = parse_markdown(md, resolve);
     let view = View::on_branch(f64::INFINITY, branch);
     let scores = score::score_all(m, &view);
@@ -306,8 +323,8 @@ pub fn import_markdown_named(
         .filter(|n| n.has(flags::CORE) && scores[n.id as usize].visible)
         .map(|n| text::approx_tokens(super::hook::injected_text(n)) + 5)
         .sum();
-    if used > 0 {
-        select_core(&mut items, BUDGET_CORE.saturating_sub(used));
+    if used > 0 || core_budget != BUDGET_CORE {
+        select_core(&mut items, core_budget.saturating_sub(used));
     }
 
     // Flags on existing nodes (`STALE`, moving `CORE`) are shared by every branch: like `verify`,

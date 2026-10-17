@@ -13,7 +13,7 @@ cargo test
 cargo clippy --all-targets
 ```
 
-Las dos tienen que terminar limpias: tests en verde y clippy sin avisos.
+Las dos tienen que terminar limpias: tests en verde y clippy sin avisos. Si cambiaste `cthg`, reinstálalo (`cargo install --path crates/cthg-cli --locked`): los hooks de todos los proyectos usan el del PATH.
 
 ## Cómo trabajar
 

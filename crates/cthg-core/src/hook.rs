@@ -211,16 +211,49 @@ pub fn format_bands(heading: &str, m: &Memory, scores: &[Score], ids: &[u32]) ->
 
 /// Runs `session-start`: one forgetting step, then injects `CORE` nodes within `BUDGET_CORE`.
 pub fn handle_session_start(m: &mut Memory, view: &View, session: &mut SessionState) -> String {
+    handle_session_start_layered(m, view, session, None)
+}
+
+/// The user's global `CORE` (rules for every project), within `budget`. Read-only: the global
+/// memory is shared by every project, so a session never changes it. Returns the text and the
+/// tokens it used. Global ids print as `#g3` so they are not confused with the project's.
+pub fn global_core(global: &Memory, budget: usize) -> (String, usize, Vec<Vec<String>>) {
+    let scores = score::score_all(global, &View::all());
+    let all = retrieve::core(global, &scores);
+    let ids = retrieve::fit_budget(global, &all, budget, |n| render_node(global, &scores, n));
+    if ids.is_empty() {
+        return (String::new(), 0, Vec::new());
+    }
+    let used: usize = ids.iter().map(|&id| text::approx_tokens(&render_node(global, &scores, &global.nodes[id as usize]))).sum();
+    let mut out = format_bands("## Reglas globales (siempre, en todos los proyectos)", global, &scores, &ids).replace("\n- #", "\n- #g");
+    if ids.len() < all.len() {
+        out.push_str(&format!("\n({} reglas globales no caben aquí; `cthg core --global` las muestra todas)", all.len() - ids.len()));
+    }
+    let toks = ids.iter().map(|&id| text::tokens(&global.nodes[id as usize].text)).collect();
+    (out, used, toks)
+}
+
+/// A project rule that says what a global rule already said is not injected twice.
+pub const DUPLICATE_OF_GLOBAL: f32 = 0.5;
+
+/// Session start with the global layer first: global `CORE`, then the project's `CORE` in the
+/// budget left, skipping project rules that repeat a global one.
+pub fn handle_session_start_layered(m: &mut Memory, view: &View, session: &mut SessionState, global: Option<&Memory>) -> String {
     session.injected.clear();
     learn::begin_session(m);
+    let (global_out, used, global_toks) = global.map(|g| global_core(g, BUDGET_CORE)).unwrap_or_default();
     let scores = score::score_all(m, view);
     let candidates: Vec<u32> = retrieve::core(m, &scores)
         .into_iter()
         .filter(|&id| !session.was_injected(id))
+        .filter(|&id| {
+            let toks = text::tokens(&m.nodes[id as usize].text);
+            !global_toks.iter().any(|g| text::similarity(&toks, g) >= DUPLICATE_OF_GLOBAL)
+        })
         .collect();
-    let ids = retrieve::fit_budget(m, &candidates, BUDGET_CORE, |n| render_node(m, &scores, n));
+    let ids = retrieve::fit_budget(m, &candidates, BUDGET_CORE.saturating_sub(used), |n| render_node(m, &scores, n));
     if ids.is_empty() {
-        return String::new();
+        return global_out;
     }
     session.record(&ids);
     for &id in &ids {
@@ -235,7 +268,11 @@ pub fn handle_session_start(m: &mut Memory, view: &View, session: &mut SessionSt
     if missing > 0 {
         out.push_str(&format!("\n({missing} reglas del núcleo no caben aquí; `cthg core` las muestra todas)"));
     }
-    out
+    if global_out.is_empty() {
+        out
+    } else {
+        format!("{global_out}\n\n{out}")
+    }
 }
 
 /// Runs `prompt`: fuses lexical and `git status`/`git diff` spatial channels within `BUDGET_PROMPT`.
@@ -514,5 +551,42 @@ mod tests {
         let short = learn(&mut m, &Claim::rule("[Cómo trabajar › Al terminar una fase] pasa las dos comprobaciones;", ""), 2.0)[0].node;
         assert_eq!(injected_text(&m.nodes[long as usize]), "Código, identificadores y comentarios en inglés");
         assert!(injected_text(&m.nodes[short as usize]).starts_with("[Cómo trabajar › Al terminar una fase]"));
+    }
+
+    #[test]
+    fn global_core_goes_first_shares_the_budget_and_is_not_repeated() {
+        let mut global = Memory::default();
+        let mut g1 = Claim::rule("No hagas commits ni push sin que el usuario lo pida", "");
+        g1.core = true;
+        learn(&mut global, &g1, 1.0);
+        let mut g2 = Claim::rule("Comentarios e identificadores siempre en inglés", "");
+        g2.core = true;
+        learn(&mut global, &g2, 2.0);
+
+        let mut m = Memory::default();
+        let mut dup = Claim::rule("No hagas commits ni push: el usuario revisa el diff", "");
+        dup.core = true;
+        let dup = learn(&mut m, &dup, 1.0)[0].node;
+        let mut own = Claim::rule("cthg-core no tiene dependencias y debe seguir así", "");
+        own.core = true;
+        let own = learn(&mut m, &own, 2.0)[0].node;
+
+        let mut session = SessionState::new("g");
+        let out = handle_session_start_layered(&mut m, &View::all(), &mut session, Some(&global));
+        let g_at = out.find("## Reglas globales").expect("global section");
+        let p_at = out.find("## Reglas del proyecto").expect("project section");
+        assert!(g_at < p_at, "global first:\n{out}");
+        assert!(out.contains("- #g0 regla"), "global ids are marked: {out}");
+        assert!(session.was_injected(own));
+        assert!(!session.was_injected(dup), "the project rule repeating a global one is skipped");
+        assert!(!out.contains("el usuario revisa el diff"));
+
+        // Without a global memory nothing changes.
+        let mut m2 = Memory::default();
+        let mut c = Claim::rule("Nunca hagas push directo a main", "");
+        c.core = true;
+        learn(&mut m2, &c, 1.0);
+        let plain = handle_session_start(&mut m2, &View::all(), &mut SessionState::new("p"));
+        assert!(!plain.contains("globales") && plain.contains("push directo"));
     }
 }
