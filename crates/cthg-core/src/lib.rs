@@ -6,6 +6,7 @@
 
 pub mod antigravity;
 pub mod binary;
+pub mod correction;
 pub mod eval;
 pub mod hook;
 pub mod import;

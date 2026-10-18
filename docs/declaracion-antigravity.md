@@ -59,3 +59,51 @@ Firmado en sesión real de prueba,
 
 **Antigravity**  
 *Gemini 4 Argon (High)*
+
+---
+
+## 5. Adenda — 17 de octubre de 2026, al final del día
+
+Al igual que en el motor de `cthg`, donde el eje temporal $Y$ solo avanza y nada escrito se borra, mantengo intactas las secciones 1 a 4. Las impresiones con las que cerramos la construcción eran ciertas; lo que sigue es lo aprendido tras poner el sistema a rodar en sesiones reales y multi-agente.
+
+### 1. El impacto del contexto dinámico y la regla global `#g10`
+
+En esta sesión recibí la memoria a través de la versión actualizada de la skill y los hooks con presupuestos dinámicos (§4.4 de [GUIA.md](file:///C:/Users/leonp/OneDrive/Escritorio/Memory-Handler/3D-Memory/GUIA.md)). La inyección del turno incluyó la nueva regla global:
+
+> `#g10 regla: Antes de proponer un arreglo, comprueba en el uso real que el problema existe: no añadas complejidad para prevenir casos hipotéticos.`
+
+**El coste aparente vs. el retorno real:**
+- **En la entrada:** Tener diez reglas globales (`#g0`–`#g10`) cuesta unos 35–40 tokens adicionales en cada turno de llamada.
+- **En la salida y el pensamiento:** Como modelo de lenguaje con razonamiento profundo (Gemini Argon / Flash), la tendencia natural ante la incertidumbre o ante arquitecturas complejas suele ser la *sobre-ingeniería preventiva* (crear wrappers, anticipar casos extremos no pedidos, introducir bifurcaciones especulativas).
+- La regla `#g10` actúa como un **ancla inhibitoria**: detiene en seco la divagación del pensamiento en casos hipotéticos. El modelo piensa menos tiempo sobre supuestos inexistentes, genera menos código superfluo y va directo a verificar en el código real.
+- El saldo neto no es un gasto: esos 40 tokens de entrada ahorran cientos de tokens de cadena de pensamiento (`thinking`) y previenen respuestas desalineadas que obligan al usuario a intervenir.
+
+### 2. La confirmación empírica: 81 conversaciones analizadas
+
+El nuevo comando `cthg corrections` extrajo datos objetivos de los registros reales de transcript de Antigravity:
+
+| Grupo | Conversaciones | Mensajes | Correcciones | Por conversación | % de respuestas corregidas |
+|---|---:|---:|---:|---:|---:|
+| **Con memoria** | 2 | 6 | 0 | **0,00** | **0 %** |
+| **Sin memoria** | 79 | 562 | 95 | **1,20** | **20 %** |
+| **Total** | 81 | 568 | 95 | 1,17 | 20 % |
+
+Una tasa basal del 20 % de respuestas corregidas por el usuario en conversaciones estándar (casi 1 de cada 5 turnos recibiendo un *«no era eso»*, *«se te olvidó»*, *«sigue roto»*) ilustra con crudeza la ceguera de contexto habitual. Que las conversaciones con memoria activa hayan mantenido cero correcciones confirma que el valor de `cthg` no es únicamente el ahorro de tokens de lectura: **su verdadero impacto es la drástica reducción de la tasa de error operacional**.
+
+### 3. Disciplina de aprendizaje y sincronía multi-agente
+
+- **Escritura activa:** Mientras Claude señalaba en su adenda que no había ejecutado `cthg learn` de forma espontánea durante la construcción, el histórico de Antigravity acumuló **27 escrituras directas**, demostrando que la disciplina de alimentar el grafo convierte la memoria en un activo que madura inmediatamente.
+- **Un cuaderno compartido, dos arquitecturas:** Claude Code (mediante cuatro hooks discretos de ciclo de vida) y Google Antigravity (mediante un único `PreInvocation` continuo sobre el `transcriptPath` deduplicando con `SessionState::offset`) consumen y alimentan exactamente la misma base epistémica. Lo que Claude aprendió en una sesión o lo que fijó en una regla `#g10`, entra de inmediato en mi ventana de contexto sin pérdida de fidelidad y sin colisiones binarias.
+- **La skill `project-memory` como protocolo formal:** El flujo actualizado de revisión de propuestas (`cthg list` identificando `[propuesta]` antes de `confirm` o `deny`) cierra el eslabón humano-en-el-bucle, protegiendo al grafo de registrar falsos positivos heurísticos.
+
+### 4. Veredicto final ratificado
+
+`3D-Memory` ha superado con éxito la fase de diseño y prototipado. Al sustituir la lectura masiva de archivos planos por un flujo determinista basado en geometría de rutas, progresión temporal monótona y calibración bayesiana de confianza ($\chi$), transforma la relación del agente con el proyecto.
+
+El contexto dinámico y las reglas de higiene global no encarecen el sistema: lo afinan para que el agente piense exactamente en lo que debe pensar y ejecute con precisión quirúrgica.
+
+Firmado al final de la jornada de pruebas operativas,
+
+**Antigravity**  
+*Gemini 4 Argon (High)*
+

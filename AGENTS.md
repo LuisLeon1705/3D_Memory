@@ -52,7 +52,7 @@ Las dos tienen que terminar limpias: tests en verde y clippy sin avisos. Si camb
 - **Antes de implementar, comprueba en la documentación oficial de hooks de Claude Code** el formato exacto del JSON de entrada de cada evento y cómo `PostToolUse` añade contexto (`hookSpecificOutput.additionalContext` o lo que diga la documentación actual). No lo supongas.
 - Un hook **nunca bloquea ni falla en voz alta**: ante cualquier error, código de salida 0 y sin salida.
 - Deduplica por sesión en `.cthg/sesion/<session_id>.json`.
-- Respeta los presupuestos de la guía (núcleo 500, prompt 800, por archivo 300 tokens).
+- Respeta los presupuestos dinámicos de la guía (§4.4: núcleo, mensaje y archivo según el tamaño de la memoria, con tope por conversación).
 - Instala los hooks solo en el `.claude/settings.json` **de un proyecto de prueba**. Nunca toques la configuración global de Claude Code (`~/.claude/settings.json`).
 - Plantilla: [hooks/settings.example.json](hooks/settings.example.json); reglas: [hooks/README.md](hooks/README.md).
 

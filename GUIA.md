@@ -4,7 +4,7 @@ Memoria de proyecto para agentes de código (Claude Code primero). Objetivo: sus
 
 Motor: **CTHG** (*Causal-Temporal HyperGraph*): un grafo de recuerdos en un archivo binario, con tres ejes.
 
-Estado: `cthg-core` completo y probado (46 tests, más 1 del CLI); funciona con Claude Code y con Google Antigravity; CLI con `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list`, `mv`, `import`, `hook`, `verify` y `eval`. Falta la medición sobre repos reales y la fase 7 (ver [Fases](#13-fases)).
+Estado: `cthg-core` completo y probado (56 tests, más 1 del CLI); funciona con Claude Code y con Google Antigravity; CLI con `init`, `learn`, `confirm`, `deny`, `core`, `recall`, `list`, `mv`, `import`, `hook`, `verify`, `eval` y `corrections`. La memoria captura sola las correcciones del usuario al final de cada turno, como propuestas que no se inyectan hasta `cthg confirm` (sección 6.1). Falta la medición sobre repos reales y la fase 7 (ver [Fases](#13-fases)).
 
 ---
 
@@ -12,7 +12,7 @@ Estado: `cthg-core` completo y probado (46 tests, más 1 del CLI); funciona con 
 
 | Un `CLAUDE.md` | 3D-Memory |
 |---|---|
-| Se carga entero en cada sesión, venga o no al caso | Núcleo de ~300–500 tokens + lo que aplica a la tarea y a los archivos tocados |
+| Se carga entero en cada sesión, venga o no al caso | Un núcleo que crece con el proyecto y se estabiliza (sección 4.4) + lo que aplica a la tarea y a los archivos tocados |
 | Todas las líneas pesan igual | χ ∈ [−1, 1]: verificado / probable / sin evidencia / dudoso / descartado |
 | Las reglas caducan sin avisar | El tiempo solo avanza; lo sustituido o contradicho se hunde en vez de convivir |
 | No dice *por qué* existe una regla | Aristas causales: regla ← incidente / decisión que la motivó |
@@ -107,6 +107,7 @@ El punto de partida (prior) depende del origen:
 | `repo` | (20; 0,5) | +0,95 | lo demuestra el propio código |
 | `importado` | (5; 1,5) | +0,54 | lo escribió una persona en un `CLAUDE.md` |
 | `usuario` | (4; 1) | +0,60 | lo dijo el usuario |
+| `usuario`, corrección capturada | (3; 1) | +0,50 | lo dijo el usuario, pero lo eligió una heurística: es una propuesta, oculta hasta `confirm` (sección 6.1) |
 | `sesion` | (3; 1) | +0,50 | resumen de sesión |
 | `agente` | (1,5; 1,5) | 0 | deducción propia: **no cuenta como prueba** |
 
@@ -233,7 +234,50 @@ El corte relativo (un cuarto de la mejor coincidencia de la misma consulta) quit
 
 El factor de confianza va de 0,2 (χ = −1) a 1 (χ = +1): lo descartado puede aparecer, pero abajo.
 
-Después se recorta con un presupuesto de tokens (≈ caracteres/4), en orden de R, saltando lo que no cabe: núcleo ≤ 500, prompt ≤ 800, por archivo ≤ 300. La salida se agrupa por bandas de χ, cada línea con su ruta y su causa (`← …`).
+Después se recorta con un presupuesto de tokens (≈ caracteres/4), en orden de R, saltando lo que no cabe. La salida se agrupa por bandas de χ, cada línea con su ruta y su causa (`← …`).
+
+#### Presupuestos dinámicos
+
+Un presupuesto fijo (antes: núcleo 500, mensaje 800, archivo 300) falla por los dos lados. En un proyecto ligero recorta un archivo que cabría entero. En uno pesado (`.md` de más de 10 000 tokens) se queda corto para las reglas que deben estar siempre. Ahora todos dependen de `S`, lo que costaría inyectar toda la memoria del proyecto: texto + ruta + 6 tokens de línea por recuerdo, sin planes, obsoletos ni sesiones.
+
+```
+B(S; c, piso) = max( min(S, piso),  S · c / (c + S) )      (crece con S y se estabiliza en c)
+
+núcleo   = B(S; 1 500, 300)
+mensaje  = B(S; 2 000, 300) · h / (h + q)        q = palabras útiles del mensaje, h = 12
+archivo  = B(S;   600, 150)
+conversación (solo memoria del proyecto) ≤ max(S, 2 000)
+capa global: su propio tope de 600, no comparte con el proyecto
+```
+
+- **El piso:** una memoria pequeña entra entera (`S ≤ WHOLE_MAX`, con `WHOLE_MAX = 300`), porque decidir qué dejar fuera cuesta más que darla. En ese caso `core_context` no se limita a los nodos marcados `CORE`: selecciona primero los `CORE` y a continuación el resto de recuerdos inyectables ordenados por χ (descartando planes `POTENTIAL`, obsoletos `STALE`, sesiones `Session`, propuestas sin confirmar `PROPOSED`, nativos y duplicados de la capa global). El presupuesto del núcleo pasa a ser `max(budgets.core, S)`, y lo inyectado descuenta de `spent`.
+- **La curva:** crece casi como `S` al principio y se estabiliza en `c`. Un proyecto enorme no paga en proporción a su tamaño.
+- **El factor de especificidad** `h/(h + q)` va al revés que el canal léxico. Un mensaje vago («arréglalo», q = 1) recibe el 92 % de su presupuesto, porque es el que más necesita que la memoria complete lo que no dice. Uno de 12 palabras útiles recibe el 50 %, y uno de 36, el 25 %.
+- **El tope por conversación** (`spent` en el estado de sesión): por larga que sea, la memoria del proyecto nunca inyecta más que el archivo estático que sustituye. Así se corta la acumulación medida en Antigravity (5,5 k tokens en el turno 6 frente a 3,3 k del `.md`).
+
+| `S` (tamaño de la memoria) | núcleo | mensaje (q = 1 · q = 12) | archivo | conversación |
+|---:|---:|---:|---:|---:|
+| 120 (proyecto mínimo) | 120 | 111 · 60 | 120 | 2 000 |
+| 264 (`eval/tareas`, `exp-memoria`) | 264 | 224 · 122 | 196 | 2 000 |
+| 1 265 (`AGENTS.md` de este repo) | 686 | 715 · 388 | 407 | 2 000 |
+| 12 800 (los tres `.md` de Clay-Myrrh) | 1 343 | 1 597 · 865 | 573 | 12 800 |
+| 200 000 | 1 489 | 1 832 · 992 | 598 | 200 000 |
+
+`h = 12` se eligió con el conjunto de ajuste: con `h = 6`, un mensaje de 4 palabras ya perdía el 40 % y se caían reglas relevantes «fuera de presupuesto».
+
+`WHOLE_MAX = 300` se calibró comparando `eval/tareas` (`S = 264`) antes y después:
+- **Antes (`WHOLE_MAX = 0` o solo `CORE`):** canal `todo` inyectaba 224 tokens (ahorro 4 %, recall 89 %, 2 críticas perdidas: `L10!` en worker 2 por no tener ruta ni entrar en los 4 nodos auto-CORE; `L6!` en worker 3 anclada a `src/cli.rs` que un prompt sobre `tests/` no tocaba). En canales espaciales puros (`espacial` / `espacial + lectura`), recall 54 % y 9 críticas perdidas.
+- **Después (`WHOLE_MAX = 300`):** entra la memoria entera al inicio (269 tokens formateados con prefijos). Ahorro -15 %, recall **100 %**, **0 críticas perdidas** en todos los canales (incluyendo workers que escriben sin leer o mensajes sin rutas).
+- **Control de regresión:** en `eval/ejemplo` (`S = 588`), `eval/3d-memory` (`S = 1 265`) y `eval/3d-memory-prueba` (`S = 1 265`), como `S > WHOLE_MAX`, los resultados son **100 % idénticos** antes y después en las 6 configuraciones.
+
+| `todo`, antes → después | CORE humano | CORE automático |
+|---|---|---|
+| ajuste (`eval/3d-memory`) | 490 tok · 78 % → 490 · 78 % | 652 · 87 % → 699 · **89 %** |
+| prueba (una sola vez) | 473 · 79 % → 466 · 79 % | 637 · 85 % → 684 · **90 %** |
+| ejemplo sintético | 167 · 93 % → igual | — |
+| tareas (`exp-memoria`, `S = 264`) | — | 224 tok · 89 % (2 críticas) → 269 · **100 % (0 críticas)** |
+
+Las críticas perdidas no cambian en memorias medianas o grandes: 1 con el CORE humano y 0 con el automático. En memorias pequeñas (`S ≤ 300`), la inyección entera garantiza 0 críticas perdidas sin depender de que el prompt mencione los archivos.
 
 ### 4.5 Olvido y asociación
 
@@ -321,6 +365,104 @@ Rutas compatibles: una es antecesora de la otra, o alguna está vacía.
 Solo el usuario y el repo suben χ de verdad. Lo que el agente deduce entra con prior neutro (`--origin agente`).
 
 La skill [skill/SKILL.md](skill/SKILL.md) le dice al agente cuándo hacer cada cosa.
+
+### 6.1 Aprender las correcciones sin que el agente se acuerde (`cthg hook stop`)
+
+Hasta aquí todo aprendizaje dependía de que el agente ejecutara `cthg learn`, y en la práctica no lo hace (lo reconoce en [docs/declaracion-claude.md](docs/declaracion-claude.md)). Pero la corrección ya está escrita: el siguiente mensaje del usuario dice que el turno anterior falló. Al terminar cada turno, el hook `Stop` lee el transcript entero (Claude Code: `transcript_path`; Antigravity: `transcriptPath`) y hace seis cosas, sin modelos: solo listas fijas y reglas deterministas.
+
+**1. Turnos.** Un turno es un mensaje del usuario y los archivos que el agente leyó o escribió hasta el siguiente (Claude Code: `Read`, `Edit`, `MultiEdit`, `Write`, `NotebookEdit`; Antigravity: `view_file`, `write_to_file`, `replace_file_content`). No cuenta lo que no escribió una persona: recordatorios del sistema, notificaciones, salidas de comandos, preguntas laterales, mensajes de subagentes, bloques pegados (`<pasted_content>`) ni un mismo mensaje reenviado dos veces seguidas. El formato del transcript de Claude Code es interno y cambia entre versiones, así que el lector ignora lo que no reconoce.
+
+**2. ¿Corrige el turno anterior?** El primer mensaje de una conversación nunca. De los demás se toman solo **las palabras propias del usuario**:
+
+- sin lo que va entre comillas («…», "…", “…”, `` `…` ``). Citar «arréglalo» al hablar de correcciones, o pegar el informe de otro agente entre comillas, no corrige nada;
+- una comilla que no se cierra, o que no se cierra en 300 caracteres, es texto pegado y llega hasta el final. Sin este límite, las comillas de dentro de un bloque pegado lo cierran antes de tiempo y dejan fuera lo que citaba;
+- sin lo que sigue a «resultado: / dice: / dijo: / dio: / respondió: / says: …» («antigravity da este resultado: …»).
+
+De esas palabras se miran las 60 primeras, plegadas (minúsculas, sin tildes), de la señal más fuerte a la más débil:
+
+| Señal | Ejemplos | Cuenta |
+|---|---|---|
+| frase de corrección | «no lo había pedido así», «no es a lo que me refería», «te dije que», «se te olvidó», «te faltó», «rompiste», «fallaste», «no hizo nada», «mismo error», «arréglalo», «hazlo de nuevo», «devuelve los cambios»; «not what I asked», «I told you», «you broke», «nothing changed» | siempre |
+| persistencia | «sigue / siguen / aún / todavía / still» con una palabra de fallo en las 4 siguientes («sigue sin funcionar», «aún están rotos», «still giving 0.1»); «otra vez / de nuevo / nuevamente / again» con un fallo explícito delante («allí es donde caes nuevamente», «falla otra vez») o una palabra de fallo detrás; «¿por qué borraste…?» | siempre |
+| apertura | «no, …», «nope», «casi, …», «mal, …» (pero no «no, gracias», «no te preocupes», «no sé», ni «no, también…», que añade algo al pedido) | si no es una pregunta |
+| veredicto | «no funciona», «no veo…», «tampoco funciona», «no es legible», «está muy mal», «son malísimos», «tienes un desastre», «is broken» | si no es una pregunta y está en las 12 primeras palabras |
+
+- Las preguntas solo cuentan con señal fuerte: «¿te falta mucho?» no es una corrección; «¿por qué borraste el test?» sí.
+- «Todavía no lo he probado» es un paso pendiente del usuario, no un fallo del agente.
+- Las 60 palabras existen porque un prompt largo que cita «arréglalo» o un texto pegado en inglés con «again» son tareas nuevas, no correcciones. Las señales débiles exigen además el principio: más abajo suele empezar un informe de algo nuevo («… y deberíamos revisar los que están mal»).
+
+**3. Emparejar.** La corrección se junta con:
+
+- **El pedido que corrige**: el último mensaje anterior que no era, a su vez, una corrección. «siguen rotas» después de «no, así no» corrige el pedido original.
+- **Los archivos**: los que escribió el turno corregido; si no escribió nada, los que escribe el turno de la corrección (el arreglo); si tampoco, los que leyó. Sin rutas fuera del repo ni ruido (`target/`, lockfiles…). Con varios archivos, la regla va a la carpeta más profunda que los contiene a todos (herencia λ, sección 3.1). Si solo coinciden en la raíz, que tiene afinidad 0 y nunca se recuperaría por ruta, va al archivo más editado.
+
+**4. Aprender**, como si se hubiera escrito `cthg learn "<corrección>" --path <ruta> --cause "<pedido>"`:
+
+- **Texto**: las palabras del usuario (hasta 280 caracteres). Si tienen menos de 3 palabras con contenido («siguen rotas»), no se entienden solas: llevan el pedido, «siguen rotas (al pedir «arregla las ventanas»)».
+- **Causa**: un `incidente` «Corrección del usuario al pedir «…»». Si el pedido ya va en el texto, la causa cita la corrección («Corrección del usuario: «siguen rotas»»), para no repetirlo. El incidente queda **sin ruta**: ya se ve en la línea de la regla (`← …`), y anclado al mismo archivo se inyectaría otra vez como línea propia.
+- **Repetición**: si repite un recuerdo visible (similitud ≥ 0,5, ruta compatible), `learn` lo **refuerza** (α + 1) en vez de crear otro, como en el punto 2 de arriba. La misma queja en dos conversaciones refuerza la primera.
+- **Prior (3; 1)** en vez del (4; 1) de `usuario`, y flag **`PROPOSED`** en la regla y en su incidente: es una propuesta (punto 6).
+- **Solo se funde con propuestas.** Un `cthg learn` deliberado nunca refuerza una propuesta oculta: crea su propia regla, que se inyecta como siempre. Si no, decir una regla a propósito podría dejarla escondida.
+
+**5. Una sola vez.** `.cthg/correcciones.txt` guarda la huella de cada corrección aprendida (FNV-1a de turno, pedido y corrección, más un recorte legible). Un segundo `Stop` sobre el mismo transcript, una sesión reanudada o una bifurcada que copia el historial no la aprenden otra vez. Si la memoria está ocupada por otro proceso, se deja para el turno siguiente. El hook nunca bloquea: en Claude Code no escribe nada y en Antigravity responde `{}`.
+
+**6. Propuesta, no regla.** Una heurística se equivoca: en la primera versión, las 3 detecciones de la conversación de diseño de este repo eran falsas (sección 12.8). Por eso lo capturado no se inyecta hasta que alguien lo confirma:
+
+| Canal | Una propuesta (`PROPOSED`) |
+|---|---|
+| 0 · núcleo | nunca |
+| 1 + 3 · mensaje (`prompt`, `cthg recall`) | nunca, aunque nombre la ruta o las palabras del mensaje |
+| 2 · lectura (`read`) | solo al leer uno de sus archivos: anclada en ese archivo o en una carpeta que lo contiene. Sale en la banda «[sin evidencia]» |
+| propagación | no entra arrastrada por sus vecinos |
+
+- **`cthg confirm <id>`** es lo único que quita `PROPOSED`. A partir de ahí es una regla del usuario más (α + 1 → 0,30).
+- **`cthg deny <id>`** la debilita y la deja oculta.
+- **`cthg list`** la marca `[propuesta]`.
+- **La misma corrección otra vez** la refuerza (α + 1), pero sigue oculta.
+- **El presupuesto sí la cuenta.** Las propuestas entran en `S` (sección 4.4): se inyectan al leer sus archivos, y en una memoria pequeña sin ellas no habría sitio en esa lectura.
+
+Con números (sin causas estructurales, E = 0):
+
+- **Corrección capturada**: α = 3, β = 1 → A = 0,5; e = 2 → w = 0,6 → χ = 0,6·0 + 0,4·0,5 = **0,20** (sin evidencia).
+- **Tras un `confirm`, o la misma corrección otra vez**: α = 4, β = 1 → **0,30**, lo mismo que una regla dicha con `learn` (ejemplo 1 de la sección 3.4).
+- **Tras un `deny`**: α = 3, β = 2 → A = 0,2; e = 3 → w = 0,5 → **0,10**. Con dos, 0.
+- **Una corrección que repite una regla del usuario** (4; 1) la sube a (5; 1): A = 0,67; e = 4 → w = 3/7 → χ = 4/7·0,67 = **0,38**.
+
+Al leer sus archivos, el factor de confianza del ranking (0,6 + 0,4·χ, sección 4.4) vale 0,68 con χ = 0,20 y 0,72 con 0,30: compite casi igual que una regla dicha, pero en la banda «[sin evidencia]». La consolidación pide 3 de evidencia sobre el prior de `usuario`, (4; 1), así que a una corrección capturada le hacen falta 4.
+
+Salida real en un repo de prueba (el pedido fue «pon el botón de guardar en la barra de arriba» y el agente editó `src/ui/boton.rs` y `src/main.rs`; luego el usuario escribió «no, te dije que los mensajes del CLI en español, no en inglés» y, tras otro cambio en `src/main.rs`, «siguen rotas»):
+
+```
+$ cthg list
+#0    χ +0.38 regla       usuario    src [] Los mensajes del CLI van en español
+#1    χ +0.20 regla       usuario    src/main.rs [propuesta] siguen rotas (al pedir «pon el botón de guardar en la barra de a…
+#2    χ +0.20 incidente   usuario    / [propuesta] Corrección del usuario: «siguen rotas»
+```
+
+La primera corrección repetía la regla #0 y la reforzó de 0,30 a 0,38. La segunda es nueva y queda como propuesta. `cthg recall --prompt "siguen rotas las ventanas" --path src/main.rs` solo trae la #0. Al leer `src/main.rs`, el hook inyecta:
+
+```
+## Memoria relevante (src/main.rs)
+[probable]
+- #0 regla (src): Los mensajes del CLI van en español
+[sin evidencia]
+- #1 regla (src/main.rs): siguen rotas (al pedir «pon el botón de guardar en la barra de arriba») ← Corrección del usuario: «siguen rotas»
+```
+
+Y tras confirmarla:
+
+```
+$ cthg confirm 1
+#1 χ +0.20 → +0.30
+   era una corrección capturada: desde ahora se inyecta como las demás
+```
+
+Límites:
+
+- Las heurísticas no entienden. Una corrección sin ninguna de esas palabras («le falta un montón») se pierde, y también la que solo pega el error del programa que acaba de hacer el agente. Un informe de un bug nuevo que empieza con «está mal» puede tomarse por corrección. Por eso entra oculta hasta que se confirma.
+- La regla guarda lo que dijo el usuario, no una lección redactada. Para una regla limpia sigue valiendo `cthg learn`, que crea su propia regla visible (punto 4).
+- Hablar *sobre* correcciones solo se ignora si la frase va entre comillas. Sin comillas («el sistema evita lo de no lo había pedido así») sigue contando.
+- Una corrección capturada que repite una regla ya **visible** la refuerza aunque nadie la haya confirmado. Es el único efecto inmediato de lo capturado: sube χ, no cambia qué se inyecta.
 
 ---
 
@@ -412,6 +554,7 @@ Ejemplo con números (prior de `importado` (5; 1,5) → A = 0,54; e = 4,5 → w 
 │  │     ├─ learn.rs          aprender, planes, consolidación, feedback, olvido, hebb
 │  │     ├─ import.rs         importar Markdown, deducir rutas, proponer CORE y seguir las ediciones
 │  │     ├─ hook.rs           hooks de Claude Code, deduplicación por sesión
+│  │     ├─ correction.rs     correcciones del usuario: leerlas del transcript, aprenderlas, contarlas
 │  │     ├─ antigravity.rs    hooks de Google Antigravity: transcript y mensaje efímero
 │  │     ├─ json.rs           lector JSON mínimo (sin dependencias)
 │  │     ├─ verify.rs         verificar rutas, símbolos, dependencias y comandos contra el repo
@@ -430,7 +573,7 @@ Ejemplo con números (prior de `importado` (5; 1,5) → A = 0,54; e = 4,5 → w 
 
 Las reglas que valen para **todos** los proyectos del usuario viven en una memoria aparte: `~/.cthg/global.cthg` (o la ruta de `CTHG_GLOBAL`). Se edita con `--global` en `init`, `learn`, `confirm`, `deny`, `core`, `list` e `import`; no tiene rutas ni ramas, y `recall`, `verify`, `mv` y `eval` no aplican.
 
-En `session-start` va primero el `CORE` global y después el del proyecto, compartiendo los 500 tokens: el proyecto usa lo que deja el global. Una regla `CORE` del proyecto que repite una global (similitud ≥ 0,5) no se inyecta dos veces. Los ids globales se escriben `#g3`. `import` propone el `CORE` del proyecto dentro de lo que deja el global, y `core`/`list` avisan si no cabe.
+En `session-start` va primero el `CORE` global, con su propio tope de 600 tokens, y después el del proyecto, con el suyo (sección 4.4): ya no compiten. Una regla `CORE` del proyecto que repite una global (similitud ≥ 0,5) no se inyecta dos veces. Los ids globales se escriben `#g3`. `import` propone el `CORE` del proyecto dentro del presupuesto que tendrá la memoria al terminar de importar, y `core`/`list` avisan si no cabe.
 
 Un proyecto se reconoce por `.cthg/memoria.cthg`, no por la carpeta `.cthg/` sola: `~/.cthg/` es antecesora de todos los proyectos y nunca debe tomarse por uno.
 
@@ -444,16 +587,17 @@ En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`), `<r
 |---|---|---|
 | `cthg init` | ✅ | crea `.cthg/memoria.cthg` en la raíz git; detecta el tronco |
 | `cthg learn <texto> [--kind K] [--path P] [--symbol S] [--cause T] [--cause-id N] [--contradicts N] [--supersedes N] [--origin O] [--core] [--plan] [--deny]` | ✅ | sección 6 |
-| `cthg confirm N` / `cthg deny N` | ✅ | α + 1 / β + 1 (lo anclado no se mueve) |
+| `cthg confirm N` / `cthg deny N` | ✅ | α + 1 / β + 1 (lo anclado no se mueve); `confirm` es lo único que convierte una corrección capturada (`[propuesta]`) en regla inyectable |
 | `cthg core [<id>… [--unset]] [--budget N]` | ✅ | canal 0 tal como se inyecta (global y proyecto); con ids, marca o desmarca `CORE`. Avisa si el núcleo no cabe en el presupuesto |
 | `cthg <init\|learn\|confirm\|deny\|core\|list\|import> --global` | ✅ | lo mismo sobre la memoria global (sección 8.1) |
 | `cthg recall [--prompt T] [--path P]… [--git] [--budget N] [--limit N]` | ✅ | canales 1–3 (rutas, símbolos de `git diff`, renombres `-M`) |
 | `cthg list [--all]` | ✅ | todos los nodos con χ, flags (incluido `obsoleto`) y rama |
 | `cthg mv <de> <a>` | ✅ | la memoria sigue a un archivo o carpeta movidos |
-| `cthg import <archivo.md> [--yes]` | ✅ | parte el archivo en nodos y propone un `CORE` ordenado que cabe en 500 tokens (sección 12.6); cada nodo guarda su origen en `key` (`CLAUDE.md:L12`) y su contexto (sección 12.5). Reimportar el archivo editado sustituye lo cambiado, marca `STALE` lo borrado y lista qué es nuevo, actualizado, obsoleto y restaurado (sección 7.2) |
-| `cthg hook <session-start\|prompt\|read\|edit>` | ✅ | lee el JSON del hook por stdin, deduplica por sesión en `.cthg/sesion/<session_id>.json` |
+| `cthg import <archivo.md> [--yes]` | ✅ | parte el archivo en nodos y propone un `CORE` ordenado que cabe en el presupuesto de núcleo (secciones 4.4 y 12.6); cada nodo guarda su origen en `key` (`CLAUDE.md:L12`) y su contexto (sección 12.5). Reimportar el archivo editado sustituye lo cambiado, marca `STALE` lo borrado y lista qué es nuevo, actualizado, obsoleto y restaurado (sección 7.2) |
+| `cthg hook <session-start\|prompt\|read\|edit\|stop>`, `cthg hook antigravity`, `cthg hook antigravity-stop` | ✅ | lee el JSON del hook por stdin, deduplica por sesión en `.cthg/sesion/<session_id>.json`; `stop` y `antigravity-stop` aprenden las correcciones del usuario (sección 6.1) |
 | `cthg verify [--run-commands]` | ✅ | sección 7.1 |
 | `cthg eval <carpeta> [--markdown] [--repo DIR] [--file CLAUDE.md] [--core-auto]` | ✅ | sección 12; `--core-auto` ignora los `core:` y usa la propuesta de `import` |
+| `cthg corrections [<transcript.jsonl\|carpeta>…] [--desde AAAA-MM-DD] [--detalle]` | ✅ | correcciones del usuario por conversación, con y sin memoria (sección 12.8); sin rutas, los transcripts de Antigravity |
 | `cthg gc`, `cthg view` | fase 7 | archivar lo muerto; visor 3D con X = árbol de carpetas |
 
 ---
@@ -465,9 +609,10 @@ En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`), `<r
 | `SessionStart` | `cthg hook session-start` | 0 (global y proyecto), y un paso de olvido |
 | `UserPromptSubmit` | `cthg hook prompt` | 1 + 3 |
 | `PostToolUse` (`Read`) | `cthg hook read` | 2 (`hookSpecificOutput.additionalContext`) |
-| `PostToolUse` (`Edit\|MultiEdit\|Write`) | `cthg hook edit` | sube la activación de esa zona |
+| `PostToolUse` (`Edit\|MultiEdit\|Write`) | `cthg hook edit` | 2 (`hookSpecificOutput.additionalContext`): reglas de ese archivo y sus carpetas (si no se inyectaron antes), y sube la activación |
+| `Stop` | `cthg hook stop` | aprende las correcciones del usuario del transcript (sección 6.1); no escribe nada y nunca impide terminar |
 
-Plantilla y reglas en [hooks/](hooks/README.md). En resumen: nunca bloquear (si falla, código 0 y sin salida), no repetir dentro de una sesión y respetar el presupuesto (500 / 800 / 300 tokens). Si la memoria está bloqueada por otro proceso más de 1,5 s, el hook responde igual pero no guarda. Si el núcleo no cabe en 500 tokens, `session-start` lo dice en el propio contexto, en vez de recortarlo en silencio. Se instalan en el `.claude/settings.json` **del proyecto**, no en el global. Llaman a `cthg` por su nombre: se instala en el PATH con `cargo install --path crates/cthg-cli --locked` (repetir tras cada cambio). Para ver la memoria, la app Memoria 3D (`memviz`, en `Memory-Handler/3D-Memory-Visualizer`) abre cualquier repo con memoria.
+Plantilla y reglas en [hooks/](hooks/README.md). En resumen: nunca bloquear (si falla, código 0 y sin salida), no repetir dentro de una sesión y respetar los presupuestos dinámicos (sección 4.4). Si la memoria está bloqueada por otro proceso más de 1,5 s, el hook responde igual pero no guarda. Si el núcleo no cabe en su presupuesto, `session-start` lo dice en el propio contexto, en vez de recortarlo en silencio. Se instalan en el `.claude/settings.json` **del proyecto**, no en el global. Llaman a `cthg` por su nombre: se instala en el PATH con `cargo install --path crates/cthg-cli --locked` (repetir tras cada cambio). Para ver la memoria, la app Memoria 3D (`memviz`, en `Memory-Handler/3D-Memory-Visualizer`) abre cualquier repo con memoria.
 
 Los `CLAUDE.md` anidados por carpeta que Claude Code ya carga son la **línea base** contra la que medir.
 
@@ -477,12 +622,14 @@ Mismo motor, otro contrato de hooks. En Antigravity solo `PreInvocation` puede a
 
 | Paso nuevo en el transcript | Equivale al canal | Qué inyecta |
 |---|---|---|
-| primera llamada de la conversación | 0 | núcleo (global y proyecto), una sola vez |
-| `USER_INPUT` (turno nuevo) | 1 + 3 | lo que recuerdan el mensaje y `git status`, sin repetir nada ya inyectado |
+| primera llamada de la conversación | 0 | núcleo (global y proyecto, o memoria entera si `S ≤ WHOLE_MAX`), una sola vez |
+| `USER_INPUT` o `SYSTEM_MESSAGE` de agente (turno nuevo) | 1 + 3 | lo que recuerdan el mensaje y `git status`, sin repetir nada ya inyectado |
 | `view_file` | 2 | las reglas de ese archivo, una vez por turno |
-| `write_to_file` / `replace_file_content` | — | sube la activación |
+| `write_to_file` / `replace_file_content` | 2 | las reglas de ese archivo (si no se inyectaron antes) y sube la activación |
 
 La posición en el transcript y el turno se guardan en `.cthg/sesion/<conversationId>.json`. El olvido corre una vez por conversación.
+
+Al terminar cada turno, el evento `Stop` llama a `cthg hook antigravity-stop`, que aprende las correcciones del usuario igual que en Claude Code (sección 6.1). Responde siempre `{}`: sin `decision: "continue"`, el agente se detiene como siempre.
 
 **Archivos que el agente ya carga.** Un recuerdo importado de un archivo de reglas que el agente lee por su cuenta no se vuelve a inyectar. Se reconoce por su `key`: `AGENTS.md:L12` o `GEMINI.md:L3` en Antigravity, `CLAUDE.md:L5` en Claude Code. Así no llega dos veces. Para que un proyecto ahorre tokens de verdad, conviene que ese archivo sea corto y que el resto viva en la memoria. Detalles en [hooks/README.md](hooks/README.md#google-antigravity).
 
@@ -490,7 +637,7 @@ La posición en el transcript y el turno se guardan en `.cthg/sesion/<conversati
 
 ## 11. Formato binario
 
-Un solo archivo (versión 2; lee también la 1) con secciones `META`, `NODE`, `EDGE`, `HYPE` y CRC32 final; las secciones desconocidas se saltan.
+Un solo archivo (versión 3; lee también la 1 y la 2; se escribe como 2 si ningún nodo es una propuesta, para que los lectores de la 2 sigan abriéndolo) con secciones `META`, `NODE`, `EDGE`, `HYPE` y CRC32 final; las secciones desconocidas se saltan.
 
 Escritura segura: toda modificación se hace con `.cthg/lock`; cada escritor usa su propio `.tmp` y renombra (el anterior queda en `.bak`); si el archivo está corrupto, se carga el `.bak`. Un candado de más de 30 s se considera abandonado. χ no se guarda: se calcula al cargar para la vista activa. Especificación completa: [docs/formato-cthg.md](docs/formato-cthg.md).
 
@@ -502,7 +649,7 @@ Coste: con cientos o pocos miles de nodos, una puntuación completa es O(N log N
 
 ### 12.1 Qué se mide
 
-Para cada caso se importa el `CLAUDE.md` en una memoria **nueva y en RAM**, con reloj fijo, sin tocar el `.cthg/` del proyecto ni llamar a git. Así el resultado es determinista. Seis configuraciones, todas con los presupuestos reales (500 / 800 / 300):
+Para cada caso se importa el `CLAUDE.md` en una memoria **nueva y en RAM**, con reloj fijo, sin tocar el `.cthg/` del proyecto ni llamar a git. Así el resultado es determinista. Seis configuraciones, todas con los presupuestos reales (los dinámicos de la sección 4.4):
 
 | Configuración | Qué inyecta |
 |---|---|
@@ -608,7 +755,7 @@ candidata  = sin ruta, no es un plan, su sección no trata de un comando o módu
 puntuación = vínculo (prohibición 2 · obligación 1,5 · otra norma 1) + 1 si el autor la puso en negrita
 coste      = approx_tokens(texto) + 5
 selección  = por puntuación, luego la más barata, luego orden del documento,
-             mientras quepa en 500 − 12 tokens (cabecera) − lo que ya es CORE
+             mientras quepa en el presupuesto de núcleo − 12 tokens (cabecera) − lo que ya es CORE
 ```
 
 - Las reglas de una sección sobre un comando («Fase 4 · `cthg hook`») no son candidatas: las encuentra el canal léxico cuando la tarea nombra ese comando.
@@ -624,8 +771,56 @@ Decidido con el conjunto de ajuste (la primera versión restaba 1,5 a esas secci
 | ejemplo sintético | 171 tokens · 93 % · 1 | 188 tokens · 97 % · 1 (la de «despliego», sección 14) |
 
 - **El `CORE` automático gana al humano en lo que más importa**: cero críticas perdidas en los dos conjuntos reales y +6 a +9 puntos de recall.
-- **Lo paga en tokens** (+30 %). Con un `AGENTS.md` corto (1265 tokens) y de proceso, el núcleo es casi la mitad de lo que se inyecta, y el ahorro baja al 45–48 %. El criterio de ≥ 70 % de ahorro no es alcanzable con un núcleo de 500 tokens en un archivo de este tamaño; en archivos de varios miles de tokens el núcleo cuesta lo mismo y el ahorro crece. Esto hay que medirlo con un archivo largo.
+- **Lo paga en tokens** (+30 %). Con un `AGENTS.md` corto (1265 tokens) y de proceso, el núcleo es casi la mitad de lo que se inyecta, y el ahorro baja al 45–48 %. El criterio de ≥ 70 % de ahorro no era alcanzable con un núcleo fijo de 500 tokens en un archivo de este tamaño. Ahora el núcleo escala con el proyecto (sección 4.4): en archivos pequeños entra casi todo, y en archivos de varios miles de tokens se estabiliza, así que el ahorro crece. Esto hay que medirlo con un archivo largo.
 - **Los fallos que quedan** son reglas de proceso sin palabra normativa («Cada pieza nueva lleva tests…», «Imita el estilo existente…»): ni ruta ni norma explícita.
+
+### 12.7 Observación de campo: Antigravity con Gemini (anecdótica)
+
+Datos del usuario usando la memoria de verdad en otros repos, no medidos con `cthg eval`:
+
+- **Benchmark de Antigravity en Clay-Myrrh** (tres `.md` que suman ~12,8 k tokens): con `cthg recall`, cada propiedad costó entre 210 y 370 tokens si se conoce el archivo, y unos 780 buscando solo por texto. Leer los `.md` cuesta 3,4–8,9 k, y buscar a mano 0,9–1,5 k más 2–3 rondas de herramientas. La memoria además devolvió la decisión vigente (`PING_GRACE` = 180 s) con la antigua (30 s) marcada como sustituida, mientras el `CLAUDE.md` seguía diciendo 30 s.
+- **Uso diario con Gemini Flash (medium):** con prompts poco específicos, en el turno 6 la memoria costaba 5,5 k tokens de entrada frente a los 3,3 k del `.md`. Aun así, el agente pensó menos, tardó menos y no cometió errores en la tarea que más contexto consume (manejo directo de información). Gastó menos del 10 % de la cuota de 5 horas.
+- **Coste de operación:** afinar este proyecto consumió la mayor parte de la cuota semanal de Gemini 4 Argon. En cambio, generar nodos para 3 proyectos, actualizar repos y reescribir el `.md` de la página de GitHub del usuario costó menos del 5 %.
+
+Lectura: más entrada barata a cambio de menos pensamiento y menos correcciones parece compensar. Pero son ejecuciones sueltas, sin la misma tarea repetida con y sin memoria, y el porcentaje de cuota mezcla entrada y salida. La acumulación por conversación que se ve en el turno 6 es la que corrigen el tope por conversación y el factor de especificidad (sección 4.4).
+
+### 12.8 Correcciones por conversación (`cthg corrections`)
+
+El objetivo de fondo es que haya menos turnos de corrección («arréglalo», «yo no lo había pedido así»): que la memoria complete lo que el prompt no dice. `cthg corrections` lo mide sobre transcripts reales con el mismo detector que el hook (sección 6.1):
+
+- **Entrada**: por defecto, `~/.gemini/antigravity*/brain/*/.system_generated/logs/transcript.jsonl`. También acepta archivos o carpetas, por ejemplo una de `~/.claude/projects/` (sin los transcripts de subagentes).
+- **Con memoria**: un hook inyectó algo en esa conversación, es decir, hay un `attachment` de Claude Code o un `EPHEMERAL_MESSAGE` de Antigravity con «## Memoria relevante», «## Reglas del proyecto» o «## Reglas globales». Si esos encabezados solo aparecen en la salida de una herramienta (un `cthg recall` a mano, un archivo leído), la conversación no cuenta como «con memoria».
+- **Métricas por grupo**: correcciones por conversación y % de respuestas corregidas. El % es correcciones / mensajes que no son el primero de su conversación.
+- `--desde AAAA-MM-DD` añade el corte antes / después de una fecha (la de instalar los hooks, por ejemplo). `--detalle` lista cada corrección con la señal que la detectó, para revisar falsos positivos.
+
+Primera pasada sobre los transcripts de Antigravity del usuario (17-10-2026, `cthg corrections --desde 2026-10-16`):
+
+| Grupo | Conversaciones | Mensajes | Correcciones | Por conversación | % de respuestas corregidas |
+|---|---:|---:|---:|---:|---:|
+| con memoria | 1 | 5 | 0 | 0,00 | 0 % |
+| sin memoria | 79 | 562 | 95 | 1,20 | 20 % |
+| antes del 2026-10-16 | 67 | 516 | 92 | 1,37 | 20 % |
+| desde el 2026-10-16 | 13 | 51 | 3 | 0,23 | 8 % |
+| total | 80 | 567 | 95 | 1,19 | 20 % |
+
+Cómo leerlo:
+
+- **Es la línea base, no el resultado.** Solo una conversación tuvo el hook inyectando. Las demás usaban `cthg recall` a mano o son anteriores. La comparación de verdad llega con semanas de conversaciones con los hooks instalados.
+- **El corte por fecha no demuestra causa.** Desde el 16-10 casi todo son conversaciones cortas sobre la propia memoria, no tareas largas de código, que es donde salen las correcciones.
+- **Precisión revisada a mano**: unas 85 de las 95 se quejan del resultado del turno anterior («sigue roto», «no hizo nada», «te dije que…»). El resto son informes de bugs del mismo programa que pueden ser previos. La primera versión contaba 104: los falsos positivos encontrados (prompts largos que citaban «arréglalo», un «again» en texto pegado, reenvíos, un «…no los tiles, de nuevo funcionará…») llevaron a la ventana de 60 palabras, a ignorar los reenvíos y a exigir un fallo explícito delante de «de nuevo». Los arreglos posteriores (comillas, citas, «no, también», «nuevamente», «desastre») no cambian ninguna de las 95.
+
+Revisión por proyecto, a mano (18-10-2026):
+
+| Conjunto | Mensajes | Detecciones | Correcciones reales | Correcciones perdidas |
+|---|---:|---:|---:|---|
+| conversación de diseño de este repo (Claude Code), primera versión | 46 | 3 | **0** | 2 |
+| la misma, versión actual | 46 | 2 | **2** | 0 |
+| Clay-Myrrh (4 conversaciones de Antigravity, sin tocar el detector) | 12 | 1 | **1** | 1 |
+
+- **Diseño, primera versión**: las 3 detecciones eran falsos positivos. «no, también está este manga» añade algo al pedido. «…los prompts innecesarios de "arréglalo" "yo no lo había pedido así"…» cita ejemplos. «pregunta esto, opiniones? "La memoria ya aprende sola…"» cita un informe. Y se le escaparon las dos correcciones reales: «tienes un desastre en la estructura… eso no es legible… borra el gráfico» y «allí es donde caes nuevamente».
+- **Diseño, versión actual**: detecta esas dos y ninguno de los tres falsos positivos. Un arreglo intermedio dejó escapar otro: un bloque pegado entre comillas con comillas dentro. De ahí sale el límite de 300 caracteres. **Esta conversación es ya conjunto de ajuste**: los arreglos se hicieron mirándola, así que su 2 de 2 no demuestra nada (sección 12.4).
+- **Clay-Myrrh**: la única detección, «se te olvidó algo sutil… no añadiste el gitignore ni los workflows», es una corrección real. Se pierde una: un mensaje que solo pega el error del programa recién hecho («Error durante la ejecución: No Windows console found…»). La muestra es muy pequeña (12 mensajes) para dar una tasa.
+- **Claude Code en conjunto**: este repo no tiene todavía un grupo sin memoria con el que comparar.
 
 ### 12.4 Siguientes mediciones
 
@@ -647,6 +842,7 @@ Criterio de éxito: ≥ 70 % menos tokens que `completo`, **cero** críticas per
 | 4 | `cthg hook` + deduplicación por sesión + instalar en un proyecto de prueba | ✅ (18 tests) |
 | 5 | `verify` (anclar y desanclar contra el repo), más arreglos: símbolo del método editado, aviso de núcleo desbordado, renombres solo en el tronco, candado de escritura, `core --unset` | ✅ (27 tests) |
 | 6 | `cthg eval` + conjunto sintético (sección 12); falta medir repos reales | ✅ (32 tests) |
+| 6b | La memoria captura sola las correcciones del usuario, como propuestas que no se inyectan hasta `confirm`: hook `Stop` en Claude Code y Antigravity (sección 6.1) y `cthg corrections` para medirlas (sección 12.8). Formato v3 (flag `PROPOSED`) | ✅ (56 tests) |
 | 7 | Ramas fusionadas visibles en el tronco, `gc`, visor 3D | pendiente |
 
 ---

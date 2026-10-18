@@ -9,6 +9,9 @@
     "PostToolUse": [
       { "matcher": "Read", "hooks": [{ "type": "command", "command": "cthg hook read" }] },
       { "matcher": "Edit|MultiEdit|Write", "hooks": [{ "type": "command", "command": "cthg hook edit" }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "cthg hook stop" }] }
     ]
   }
 }

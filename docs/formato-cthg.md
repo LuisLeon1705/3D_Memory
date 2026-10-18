@@ -1,9 +1,9 @@
-# Formato `.cthg` (versión 2)
+# Formato `.cthg` (versión 3)
 
 Little endian. Cadenas = `u32` longitud + bytes UTF-8. Listas de ids = `u32` cuenta + `u32`×n.
 
 ```text
-cabecera   "CTHG" | u16 versión (=2; se lee también 1) | u16 reservado (=0) | u32 nº de secciones
+cabecera   "CTHG" | u16 versión (=3, o 2 si ningún nodo es PROPOSED; se leen también 1 y 2) | u16 reservado (=0) | u32 nº de secciones
 sección*   [u8;4] etiqueta | u32 longitud | carga
 cola       u32 CRC32 (IEEE) de todos los bytes anteriores
 ```
@@ -12,6 +12,8 @@ Las secciones desconocidas se saltan: un lector viejo abre un archivo nuevo.
 Al guardar: con `.cthg/lock` tomado, cada escritor escribe su propio `memoria.cthg.<pid>.<ns>.tmp`, copia el archivo anterior a `memoria.cthg.bak` y renombra (atómico). Al leer, si el archivo falla (CRC, truncado), se carga `memoria.cthg.bak`.
 
 Versión 2 = versión 1 + el bit 4 de `flags` (`STALE`). La disposición de bytes es la misma, por eso un archivo v1 se lee tal cual.
+
+Versión 3 = versión 2 + el bit 5 de `flags` (`PROPOSED`: corrección capturada por el hook `Stop`, oculta hasta `cthg confirm`; GUIA §6.1). La disposición sigue igual. Un archivo se escribe como 3 solo si algún nodo lleva ese bit; si no, como 2, así un lector de la versión 2 sigue abriendo toda memoria sin propuestas.
 
 ## META
 `u32 sesión` · `u32 n` · n × (`str clave`, `str valor`)
@@ -26,7 +28,7 @@ Claves usadas: `trunk` (rama tronco), `created` (Unix).
 | id | u32 | consecutivo desde 0 (se valida) |
 | kind | u8 | 0 regla · 1 decision · 2 hecho · 3 incidente · 4 convencion · 5 plan · 6 comando · 7 sesion |
 | origin | u8 | 0 repo · 1 importado · 2 agente · 3 usuario · 4 sesion |
-| flags | u8 | bit0 ANCHORED · bit1 CONSOLIDATED · bit2 CORE · bit3 POTENTIAL · bit4 STALE (v2) |
+| flags | u8 | bit0 ANCHORED · bit1 CONSOLIDATED · bit2 CORE · bit3 POTENTIAL · bit4 STALE (v2) · bit5 PROPOSED (v3) |
 | path | str | X: ruta relativa con `/`; vacía = todo el proyecto |
 | symbol | str | X fino: función o tipo; vacío = la ruta entera |
 | branch | str | rama donde se aprendió; vacía = tronco |

@@ -9,7 +9,7 @@ use cthg_core::retrieve::{self, Query};
 use cthg_core::score::{self, certainty_tag, View};
 use cthg_core::spatial::{self, Target};
 use cthg_core::verify::{self, RepoProbe, VerifyAction};
-use cthg_core::{binary, eval, hook, import, text};
+use cthg_core::{binary, correction, eval, hook, import, text};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -23,6 +23,9 @@ const SES_DIR: &str = "sesion";
 const NOISE: &[&str] = &["Cargo.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock"];
 const NOISE_DIRS: &[&str] = &["target/", "node_modules/", "dist/", "build/", ".cthg/"];
 const MAX_GIT_PATHS: usize = 12;
+/// Corrections already learned in this repo, one fingerprint per line: a second `Stop` over the
+/// same transcript, or a resumed session, does not learn them again.
+const LEDGER: &str = "correcciones.txt";
 /// A lock older than this was left by a crashed writer.
 const STALE_LOCK: Duration = Duration::from_secs(30);
 /// Hooks wait less than commands: if the memory is busy they answer read-only.
@@ -41,11 +44,14 @@ const HELP: &str = "cthg — memoria de proyecto (ruta · tiempo · confianza)
   cthg list [--all]
   cthg mv <de> <a>       (la memoria sigue a un archivo o carpeta movidos)
   cthg import <archivo.md> [--yes]
-  cthg hook <session-start|prompt|read|edit>     (Claude Code)
-  cthg hook antigravity                          (Google Antigravity, PreInvocation)
+  cthg hook <session-start|prompt|read|edit|stop>    (Claude Code)
+  cthg hook antigravity                              (Google Antigravity, PreInvocation)
+  cthg hook antigravity-stop                         (Google Antigravity, Stop)
   cthg verify [--run-commands]
   cthg <init|learn|confirm|deny|core|list|import> --global   (memoria de todos los proyectos)
   cthg eval <carpeta> [--markdown] [--repo DIR] [--file CLAUDE.md] [--core-auto]
+  cthg corrections [<transcript.jsonl|carpeta>...] [--desde AAAA-MM-DD] [--detalle]
+      (correcciones del usuario por conversación; sin rutas, los transcripts de Antigravity)
 
 Pendiente: gc y view (fase 7).";
 
@@ -68,7 +74,7 @@ struct Args {
     opts: Vec<(String, Option<String>)>,
 }
 
-const FLAGS: &[&str] = &["core", "plan", "deny", "git", "all", "yes", "unset", "run-commands", "markdown", "core-auto", "global"];
+const FLAGS: &[&str] = &["core", "plan", "deny", "git", "all", "yes", "unset", "run-commands", "markdown", "core-auto", "global", "detalle"];
 
 impl Args {
     fn parse(raw: &[String]) -> Result<Self, String> {
@@ -313,7 +319,7 @@ fn run(raw: &[String]) -> Result<(), String> {
     let a = Args::parse(rest)?;
     let repo = if a.flag("global") { Repo::global()? } else { Repo::open() };
     if repo.global {
-        if matches!(cmd.as_str(), "recall" | "verify" | "mv" | "eval" | "hook") {
+        if matches!(cmd.as_str(), "recall" | "verify" | "mv" | "eval" | "hook" | "corrections") {
             return Err(format!("`{cmd}` no aplica a la memoria global: no tiene rutas ni repo"));
         }
         if a.get("path").is_some() || a.get("symbol").is_some() {
@@ -387,15 +393,19 @@ fn run(raw: &[String]) -> Result<(), String> {
             let (mut m, _lock) = repo.load_locked()?;
             let id = parse_id(&m, a.pos.first())?;
             let before = score::score_all(&m, &view(&repo, &m))[id as usize].chi;
+            let proposed = m.nodes[id as usize].has(flags::PROPOSED);
             if !learn::feedback(&mut m, id, if cmd == "confirm" { 1 } else { -1 }) {
                 return Err(format!("#{id} está anclado al repo: solo `verify` lo cambia"));
             }
             repo.save(&m)?;
             let after = score::score_all(&m, &view(&repo, &m))[id as usize].chi;
             println!("#{id} χ {before:+.2} → {after:+.2}");
+            if proposed && cmd == "confirm" {
+                println!("   era una corrección capturada: desde ahora se inyecta como las demás");
+            }
         }
         "core" => {
-            let budget = a.num("budget")?.unwrap_or(hook::BUDGET_CORE);
+            let budget_arg: Option<usize> = a.num("budget")?;
             if !a.pos.is_empty() {
                 let (mut m, _lock) = repo.load_locked()?;
                 let mut ids = Vec::new();
@@ -415,21 +425,22 @@ fn run(raw: &[String]) -> Result<(), String> {
                 for id in ids {
                     println!("{action:<12} #{:<4} {}", id, m.nodes[id as usize].label);
                 }
-                warn_core_overflow(&m, &score::score_all(&m, &view(&repo, &m)), budget.saturating_sub(global_used(&repo)));
+                let budget = budget_arg.unwrap_or(core_budget(&repo, &m));
+                warn_core_overflow(&m, &score::score_all(&m, &view(&repo, &m)), budget);
                 return Ok(());
             }
             let m = repo.load()?;
             let scores = score::score_all(&m, &view(&repo, &m));
-            // Exactly what session start injects: the global layer first, then this memory.
-            let (global_out, used, global_toks) = match (repo.global, load_global()) {
-                (false, Some(g)) => hook::global_core(&g, budget),
+            let budget = budget_arg.unwrap_or(core_budget(&repo, &m));
+            // Exactly what session start injects: the global layer first (its own budget), then this memory.
+            let (global_out, _, global_toks) = match (repo.global, load_global()) {
+                (false, Some(g)) => hook::global_core(&g, hook::GLOBAL_CORE_MAX),
                 _ => Default::default(),
             };
             if !global_out.is_empty() {
                 println!("{global_out}\n");
             }
             let ids = project_core(&m, &scores, &global_toks);
-            let budget = budget.saturating_sub(used);
             let shown = retrieve::fit_budget(&m, &ids, budget, |n| render(&m, &scores, n));
             if !shown.is_empty() {
                 println!("{}", if repo.global { "## Reglas globales (siempre, en todos los proyectos)" } else { "## Reglas del proyecto (siempre)" });
@@ -464,8 +475,13 @@ fn run(raw: &[String]) -> Result<(), String> {
             let scores = score::score_all(&m, &view(&repo, &m));
             let q = Query { text: a.get("prompt").unwrap_or("").to_string(), targets };
             let limit = a.num("limit")?.unwrap_or(40);
-            let budget = a.num("budget")?.unwrap_or(800);
-            let ids: Vec<u32> = retrieve::recall(&m, &scores, &q, limit, -1.0).iter().map(|r| r.id).collect();
+            let budget = a.num("budget")?.unwrap_or(hook::Budgets::of(&m).for_prompt(a.get("prompt").unwrap_or("")));
+            // Like the message hook: unconfirmed proposals stay out.
+            let ids: Vec<u32> = retrieve::recall(&m, &scores, &q, limit, -1.0)
+                .iter()
+                .map(|r| r.id)
+                .filter(|&id| hook::may_inject(&m.nodes[id as usize], None))
+                .collect();
             let ids = retrieve::fit_budget(&m, &ids, budget, |n| render(&m, &scores, n));
             if !ids.is_empty() {
                 println!("## Memoria relevante");
@@ -487,6 +503,7 @@ fn run(raw: &[String]) -> Result<(), String> {
                     (flags::CONSOLIDATED, "consolidado"),
                     (flags::POTENTIAL, "plan"),
                     (flags::STALE, "obsoleto"),
+                    (flags::PROPOSED, "propuesta"),
                 ] {
                     if n.has(f) {
                         tags.push(t);
@@ -505,7 +522,7 @@ fn run(raw: &[String]) -> Result<(), String> {
                     n.label
                 );
             }
-            warn_core_overflow(&m, &scores, hook::BUDGET_CORE.saturating_sub(global_used(&repo)));
+            warn_core_overflow(&m, &scores, core_budget(&repo, &m));
         }
         "mv" => {
             let (mut m, _lock) = repo.load_locked()?;
@@ -530,9 +547,8 @@ fn run(raw: &[String]) -> Result<(), String> {
             let source = spatial::normalize(file_arg);
             let files = repo_files(&repo.root);
             let resolve = |p: &str| resolve_in(&files, &repo.root, p);
-            // The CORE proposal fits in what the global layer leaves.
-            let core_budget = hook::BUDGET_CORE.saturating_sub(global_used(&repo));
-            let report = import::import_markdown_in(&mut m, &source, &md, &branch, &commit, now(), apply_core, core_budget, resolve);
+            // The CORE proposal fits in the budget the memory will have once imported.
+            let report = import::import_markdown_in(&mut m, &source, &md, &branch, &commit, now(), apply_core, None, resolve);
             repo.save(&m)?;
             let scores = score::score_all(&m, &view(&repo, &m));
             let line = |action: &str, id: u32| {
@@ -603,7 +619,7 @@ fn run(raw: &[String]) -> Result<(), String> {
                     "Para confirmarlas como CORE ejecuta:\n  cthg import {file_arg} --yes\no elige cuáles marcar con:\n  cthg core <id>..."
                 );
             }
-            warn_core_overflow(&m, &scores, core_budget);
+            warn_core_overflow(&m, &scores, core_budget(&repo, &m));
         }
         "verify" => {
             let (mut m, _lock) = repo.load_locked()?;
@@ -682,6 +698,24 @@ fn run(raw: &[String]) -> Result<(), String> {
 escrito: {}", path.display());
             }
         }
+        "corrections" => {
+            let files: Vec<PathBuf> = if a.pos.is_empty() {
+                antigravity_transcripts()
+            } else {
+                a.pos.iter().flat_map(|p| jsonl_under(Path::new(p))).collect()
+            };
+            if files.is_empty() {
+                return Err("no encontré transcripts (~/.gemini/antigravity*/brain/*/.system_generated/logs/transcript.jsonl); pasa archivos o carpetas".into());
+            }
+            let stats: Vec<correction::ConvStats> = files
+                .iter()
+                .filter_map(|f| {
+                    let raw = fs::read(f).ok()?;
+                    Some(correction::stats(&conversation_name(f), &correction::parse(&String::from_utf8_lossy(&raw))))
+                })
+                .collect();
+            print!("{}", correction::report(&stats, a.get("desde"), a.flag("detalle")));
+        }
         "gc" | "view" => {
             return Err(format!("`{cmd}` aún no está implementado (ver GUIA.md, sección Fases)"));
         }
@@ -748,18 +782,20 @@ fn check_repo_claim(repo: &Repo, m: &mut Memory, id: u32) {
     }
 }
 
-/// Tokens the global layer takes at session start (0 for the global memory itself).
-fn global_used(repo: &Repo) -> usize {
+/// The `CORE` budget of a memory: the global one has a fixed one, a project's grows with it.
+fn core_budget(repo: &Repo, m: &Memory) -> usize {
     if repo.global {
-        return 0;
+        hook::GLOBAL_CORE_MAX
+    } else {
+        hook::Budgets::of(m).core
     }
-    load_global().map(|g| hook::global_core(&g, hook::BUDGET_CORE).1).unwrap_or(0)
 }
 
 /// This memory's `CORE`, minus the rules that repeat a global one (they are injected once).
 fn project_core(m: &Memory, scores: &[score::Score], global_toks: &[Vec<String>]) -> Vec<u32> {
     retrieve::core(m, scores)
         .into_iter()
+        .filter(|&id| hook::may_inject(&m.nodes[id as usize], None))
         .filter(|&id| {
             let toks = text::tokens(&m.nodes[id as usize].text);
             !global_toks.iter().any(|g| text::similarity(&toks, g) >= hook::DUPLICATE_OF_GLOBAL)
@@ -769,7 +805,7 @@ fn project_core(m: &Memory, scores: &[score::Score], global_toks: &[Vec<String>]
 
 /// Core rules that don't fit the session-start budget are never injected: say so, loudly.
 fn warn_core_overflow(m: &Memory, scores: &[score::Score], budget: usize) {
-    let global_toks = load_global().map(|g| hook::global_core(&g, hook::BUDGET_CORE).2).unwrap_or_default();
+    let global_toks = load_global().map(|g| hook::global_core(&g, hook::GLOBAL_CORE_MAX).2).unwrap_or_default();
     let all = project_core(m, scores, &global_toks);
     let kept = retrieve::fit_budget(m, &all, budget, |n| render(m, scores, n));
     if kept.len() < all.len() {
@@ -823,23 +859,30 @@ fn run_antigravity(raw: &str) -> Result<String, String> {
         parts.push(hook::core_context(&mut m, &v, &mut session, global.as_ref()));
         session.turn = CORE_GIVEN;
     }
-    let last_user = steps.iter().rposition(|s| matches!(s, Step::User { index, .. } if *index > session.turn));
-    if let Some(Step::User { index, text }) = last_user.map(|i| &steps[i]) {
+    let last_msg = steps.iter().rposition(|s| matches!(s, Step::User { index, .. } | Step::Agent { index, .. } if *index > session.turn));
+    if let Some(Step::User { index, text } | Step::Agent { index, text, .. }) = last_msg.map(|i| &steps[i]) {
         let (git_ts, _) = repo.sync_git_and_targets(&mut m);
         parts.push(hook::handle_prompt(&mut m, &v, &mut session, text, git_ts));
         session.turn = *index;
     }
-    // Files read in this turn (what came before its message belongs to a context already gone).
-    let from = last_user.map(|i| i + 1).unwrap_or(0);
-    for step in &steps {
+    // Files read or written in this turn (edits before its message still refresh activation).
+    let from = last_msg.map(|i| i + 1).unwrap_or(0);
+    for step in &steps[..from] {
         if let Step::Edit(path) = step {
             hook::handle_edit(&mut m, &hook::relativize_path(&repo.root, path));
         }
     }
     for step in &steps[from..] {
-        if let Step::Read(path) = step {
-            let rel = hook::relativize_path(&repo.root, path);
-            parts.push(hook::read_context(&mut m, &v, &mut session, &rel));
+        match step {
+            Step::Read(path) => {
+                let rel = hook::relativize_path(&repo.root, path);
+                parts.push(hook::read_context(&mut m, &v, &mut session, &rel));
+            }
+            Step::Edit(path) => {
+                let rel = hook::relativize_path(&repo.root, path);
+                parts.push(hook::edit_context(&mut m, &v, &mut session, &rel));
+            }
+            _ => {}
         }
     }
 
@@ -866,8 +909,19 @@ fn run_hook(rest: &[String]) -> Result<(), String> {
         println!("{}", run_antigravity(&raw_json).unwrap_or_else(|_| "{}".into()));
         return Ok(());
     }
+    if event == "antigravity-stop" {
+        let p = cthg_core::antigravity::parse_payload(&raw_json);
+        let _ = learn_corrections((!p.workspace.is_empty()).then(|| Path::new(&p.workspace)), &p.transcript);
+        println!("{{}}");
+        return Ok(());
+    }
     let input = hook::HookInput::parse(&raw_json);
     let start = (!input.cwd.is_empty()).then(|| Path::new(&input.cwd));
+    if event == "stop" {
+        // Never blocks the stop and says nothing: what it learned shows up in later recalls.
+        let _ = learn_corrections(start, &input.transcript_path);
+        return Ok(());
+    }
     let repo = Repo::open_at(start);
     // Busy memory: still answer, but read-only (the context matters more than the activation).
     let lock = repo.lock(HOOK_LOCK_WAIT);
@@ -921,13 +975,124 @@ fn run_hook(rest: &[String]) -> Result<(), String> {
         }
         "edit" => {
             let rel = hook::relativize_path(&repo.root, &input.file_path);
-            if hook::handle_edit(&mut m, &rel) > 0 {
+            let mut session = hook::SessionState::load(&ses_dir, &input.session_id);
+            session.native = native();
+            let v = view(&repo, &m);
+            let before = m.nodes.iter().filter(|n| n.activation == 1.0).count();
+            let context = hook::edit_context(&mut m, &v, &mut session, &rel);
+            let after = m.nodes.iter().filter(|n| n.activation == 1.0).count();
+            if !context.is_empty() || after != before || !rel.is_empty() {
                 save(&m);
+            }
+            if !context.is_empty() {
+                let _ = session.save(&ses_dir);
+                println!("{}", hook::format_post_tool_use(&context));
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Lockfiles and build output: never where a correction applies.
+fn is_noise(rel: &str) -> bool {
+    NOISE_DIRS.iter().any(|d| rel.starts_with(d)) || rel.rsplit('/').next().is_some_and(|f| NOISE.contains(&f))
+}
+
+/// End of a turn (`Stop` in Claude Code and in Antigravity): learns the user's corrections found
+/// in the transcript (`cthg_core::correction`). Each one is learned once (`LEDGER`); if the memory
+/// is busy, they wait for the next turn. Returns how many were learned.
+fn learn_corrections(start: Option<&Path>, transcript: &str) -> Result<usize, String> {
+    let repo = Repo::open_at(start);
+    if !repo.file.is_file() || transcript.is_empty() {
+        return Ok(0);
+    }
+    let raw = fs::read(transcript).map_err(|e| e.to_string())?;
+    let conv = correction::parse(&String::from_utf8_lossy(&raw));
+    let ledger = repo.root.join(DIR).join(LEDGER);
+    let known: Vec<String> = fs::read_to_string(&ledger)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split('\t').next().map(str::to_string))
+        .collect();
+    let relative = |p: &str| {
+        let rel = hook::relativize_path(&repo.root, p);
+        if is_noise(&rel) {
+            String::new()
+        } else {
+            rel
+        }
+    };
+    let fresh: Vec<correction::Captured> = correction::captured(&conv, relative).into_iter().filter(|c| !known.contains(&c.key)).collect();
+    if fresh.is_empty() {
+        return Ok(0);
+    }
+    let Some(_lock) = repo.lock(HOOK_LOCK_WAIT) else { return Ok(0) };
+    let mut m = repo.load()?;
+    let (branch, commit) = (repo.branch(&m), repo.commit());
+    let mut lines = String::new();
+    for c in &fresh {
+        let mut claim = c.claim.clone();
+        claim.branch = branch.clone();
+        claim.commit = commit.clone();
+        correction::learn_correction(&mut m, &claim, now());
+        lines.push_str(&format!("{}\t{}\n", c.key, text::clip(&c.correction, 60)));
+    }
+    repo.save(&m)?;
+    use std::io::Write;
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(&ledger).map_err(|e| e.to_string())?;
+    f.write_all(lines.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(fresh.len())
+}
+
+/// `~/.gemini/antigravity*/brain/*/.system_generated/logs/transcript.jsonl` (CLI, IDE, 2.0).
+fn antigravity_transcripts() -> Vec<PathBuf> {
+    let Some(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok() else {
+        return Vec::new();
+    };
+    let dirs = |p: &Path| -> Vec<PathBuf> {
+        fs::read_dir(p).map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()).collect()).unwrap_or_default()
+    };
+    let mut out: Vec<PathBuf> = dirs(&Path::new(&home).join(".gemini"))
+        .into_iter()
+        .filter(|d| d.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("antigravity")))
+        .flat_map(|d| dirs(&d.join("brain")))
+        .map(|c| c.join(".system_generated").join("logs").join("transcript.jsonl"))
+        .filter(|f| f.is_file())
+        .collect();
+    out.sort();
+    out
+}
+
+/// A transcript, or every `.jsonl` under a folder (a Claude Code project folder, say). Subagent
+/// transcripts are skipped: their prompts come from the main agent.
+fn jsonl_under(p: &Path) -> Vec<PathBuf> {
+    if p.is_file() {
+        return vec![p.to_path_buf()];
+    }
+    let mut out = Vec::new();
+    for e in fs::read_dir(p).into_iter().flatten().filter_map(|e| e.ok()) {
+        let path = e.path();
+        if path.is_dir() {
+            if path.file_name().and_then(|n| n.to_str()) != Some("subagents") {
+                out.extend(jsonl_under(&path));
+            }
+        } else if path.extension().and_then(|x| x.to_str()) == Some("jsonl") {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Short id of a conversation: its Antigravity folder (`brain/<id>/…/transcript.jsonl`) or file name.
+fn conversation_name(f: &Path) -> String {
+    let name = if f.file_stem().and_then(|s| s.to_str()) == Some("transcript") {
+        f.ancestors().nth(3).and_then(|d| d.file_name())
+    } else {
+        f.file_stem()
+    };
+    name.and_then(|n| n.to_str()).unwrap_or("?").chars().take(8).collect()
 }
 
 #[cfg(test)]
@@ -947,6 +1112,78 @@ mod tests {
         fs::create_dir_all(proj.join(DIR)).unwrap();
         fs::write(proj.join(DIR).join(FILE), b"x").unwrap();
         assert_eq!(find_root_from(Some(&proj.join(DIR))), proj);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn antigravity_write_to_file_without_read_injects_file_rules_and_agent_message_triggers_prompt_without_correction() {
+        let base = std::env::temp_dir().join(format!("cthg-agy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let mut m = Memory::default();
+        if let Some(b) = git(&base, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+            m.set_meta("trunk", b.trim());
+        }
+        // Make memory larger than WHOLE_MAX so pathed rules are not injected in core_context.
+        for i in 0..25 {
+            let mut c = Claim::rule(&format!("Regla auxiliar número {i} con varias palabras para superar el umbral"), &format!("src/other{i}.rs"));
+            c.origin = Origin::Imported;
+            learn::learn(&mut m, &c, 10.0 + i as f64);
+        }
+        let mut id_rule = Claim::rule("En src/id.rs los ids son base36 de 4 caracteres en minúscula", "src/id.rs");
+        id_rule.origin = Origin::Imported;
+        let id_node = learn::learn(&mut m, &id_rule, 100.0)[0].node;
+        let mut st_rule = Claim::rule("En src/storage.rs las tareas se guardan en tareas.tsv", "src/storage.rs");
+        st_rule.origin = Origin::Imported;
+        let st_node = learn::learn(&mut m, &st_rule, 101.0)[0].node;
+        binary::save(&m, &base.join(DIR).join(FILE)).unwrap();
+
+        // 1. Transcript with only `write_to_file` on `src/id.rs` produces the edit injection.
+        let t_write = base.join("write_only.jsonl");
+        let target_id = base.join("src").join("id.rs");
+        let line_write = format!(
+            "{{\"step_index\":0,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"tool_calls\":[{{\"name\":\"write_to_file\",\"args\":{{\"TargetFile\":\"{}\",\"CodeContent\":\"x\"}}}}]}}\n",
+            hook::escape_json(&target_id.to_string_lossy())
+        );
+        fs::write(&t_write, &line_write).unwrap();
+        let payload_write = format!(
+            "{{\"conversationId\":\"conv-write\",\"workspacePaths\":[\"{}\"],\"transcriptPath\":\"{}\"}}",
+            hook::escape_json(&base.to_string_lossy()),
+            hook::escape_json(&t_write.to_string_lossy())
+        );
+        let out_write = run_antigravity(&payload_write).unwrap();
+        assert!(out_write.contains("src/id.rs, que acabas de escribir"), "{out_write}");
+        assert!(out_write.contains("base36 de 4 caracteres"), "{out_write}");
+        let ses_write = hook::SessionState::load(&base.join(DIR).join(SES_DIR), "conv-write");
+        assert!(ses_write.was_injected(id_node));
+
+        // 2. Inter-agent `SYSTEM_MESSAGE` activates the message channel and is never a user correction.
+        let t_agent = base.join("agent_msg.jsonl");
+        let lines_agent = concat!(
+            r#"{"step_index":1,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","created_at":"2026-10-18T03:26:12Z","content":"The following is a <SYSTEM_MESSAGE> not actually sent by the user. It is provided by the system as important information to pay attention to.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-18T03:26:12Z sender=580c7845-203e-44db-a9d9-f449680aa27d priority=MESSAGE_PRIORITY_HIGH content=Construye `src/storage.rs` cumpliendo la interfaz.\n</SYSTEM_MESSAGE>"}"#,
+            "\n",
+            r#"{"step_index":2,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","created_at":"2026-10-18T03:27:25Z","content":"The following is a <SYSTEM_MESSAGE> not actually sent by the user. It is provided by the system as important information to pay attention to.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-18T03:27:24Z sender=580c7845-203e-44db-a9d9-f449680aa27d priority=MESSAGE_PRIORITY_HIGH content=no, rompiste todo, arréglalo de nuevo en src/storage.rs\n</SYSTEM_MESSAGE>"}"#,
+            "\n",
+        );
+        fs::write(&t_agent, lines_agent).unwrap();
+        let payload_agent = format!(
+            "{{\"conversationId\":\"conv-agent\",\"workspacePaths\":[\"{}\"],\"transcriptPath\":\"{}\"}}",
+            hook::escape_json(&base.to_string_lossy()),
+            hook::escape_json(&t_agent.to_string_lossy())
+        );
+        let out_agent = run_antigravity(&payload_agent).unwrap();
+        assert!(out_agent.contains("tareas.tsv"), "agent message triggered lexical recall for src/storage.rs: {out_agent}");
+        let ses_agent = hook::SessionState::load(&base.join(DIR).join(SES_DIR), "conv-agent");
+        assert!(ses_agent.was_injected(st_node));
+        assert_eq!(ses_agent.turn, 2);
+
+        // Neither `correction::parse` nor `learn_corrections` treats agent messages as user turns or corrections.
+        let conv = correction::parse(lines_agent);
+        assert!(conv.turns.is_empty());
+        assert!(correction::corrections(&conv).is_empty());
+        assert_eq!(learn_corrections(Some(&base), &t_agent.to_string_lossy()).unwrap(), 0);
+
         let _ = fs::remove_dir_all(&base);
     }
 }

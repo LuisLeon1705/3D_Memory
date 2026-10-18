@@ -1,11 +1,14 @@
-//! Claude Code lifecycle hooks (`cthg hook <session-start|prompt|read|edit>`).
+//! Claude Code lifecycle hooks (`cthg hook <session-start|prompt|read|edit|stop>`; `stop` learns
+//! the user's corrections, see `correction`).
 //!
 //! Rules:
 //! - Never block or fail out loud: on any error, exit with code 0 and print nothing.
 //! - Per-session deduplication in `<repo>/.cthg/sesion/<session_id>.json`: a memory node injected
 //!   once in a session is not injected again in that same session.
-//! - Token budgets: `session-start` (core) ≤ 500, `prompt` ≤ 800, `read` (per file) ≤ 300.
-//! - `PostToolUse` (`read`) wraps injected context in `hookSpecificOutput.additionalContext` JSON.
+//! - Dynamic token budgets (`Budgets::for_size`, GUIA §4.4): grow with the memory size `S`,
+//!   level off at a ceiling, and cap the whole conversation at `max(S, 2 000)`; a small memory
+//!   (`S ≤ WHOLE_MAX`) is injected whole at session start.
+//! - `PostToolUse` (`read` and `edit`) wraps injected context in `hookSpecificOutput.additionalContext` JSON.
 
 use super::learn;
 use super::model::*;
@@ -16,9 +19,102 @@ use super::text;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const BUDGET_CORE: usize = 500;
-pub const BUDGET_PROMPT: usize = 800;
-pub const BUDGET_READ: usize = 300;
+/// Budgets grow with the memory and level off: `B(S) = S·c / (c + S)` (GUIA §4.4).
+/// A small memory is injected almost whole; a large one never past the ceiling `c`.
+pub const CORE_CEIL: f32 = 1500.0;
+pub const PROMPT_CEIL: f32 = 2000.0;
+pub const READ_CEIL: f32 = 600.0;
+/// Useful words at which a message gets half of its prompt budget: the more a message already
+/// says, the less memory it needs ("arréglalo" needs the most).
+pub const SPECIFICITY_HALF: f32 = 12.0;
+/// However long the conversation, the project memory injects at most `max(S, this)` tokens:
+/// never more than the static file it replaces (and a little room for tiny projects).
+pub const CONVERSATION_FLOOR: usize = 2000;
+/// The global layer has its own budget; it is never taken from the project's.
+pub const GLOBAL_CORE_MAX: usize = 600;
+/// Below these sizes a memory is injected whole: it costs less than deciding what to leave out.
+pub const CORE_FLOOR: usize = 300;
+pub const PROMPT_FLOOR: usize = 300;
+pub const READ_FLOOR: usize = 150;
+/// Up to this `S`, `core_context` injects every injectable node (not just `CORE`) at session start:
+/// `CORE` first, then the rest by χ, within `max(budgets.core, S)`.
+pub const WHOLE_MAX: usize = 300;
+/// Fixed part of an injected line (`- #12 regla (ruta): `, its share of the band headers).
+const LINE_OVERHEAD: usize = 6;
+
+/// `max( min(S, floor), S·c / (c + S) )`, rounded: whole below the floor, then levelling off.
+pub fn saturate(size: usize, ceil: f32, floor: usize) -> usize {
+    let s = size as f32;
+    let curve = (s * ceil / (ceil + s)).round() as usize;
+    curve.max(size.min(floor))
+}
+
+/// Token budgets for one memory, from its size `S`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budgets {
+    /// `S`: what the injectable memories would take written out as a static file.
+    pub size: usize,
+    pub core: usize,
+    /// Per message, before the specificity factor (`for_prompt`).
+    pub prompt: usize,
+    pub read: usize,
+    /// Total the project memory may inject in one conversation.
+    pub conversation: usize,
+}
+
+impl Budgets {
+    pub fn for_size(size: usize) -> Self {
+        Budgets {
+            size,
+            core: saturate(size, CORE_CEIL, CORE_FLOOR),
+            prompt: saturate(size, PROMPT_CEIL, PROMPT_FLOOR),
+            read: saturate(size, READ_CEIL, READ_FLOOR),
+            conversation: size.max(CONVERSATION_FLOOR),
+        }
+    }
+
+    pub fn of(m: &Memory) -> Self {
+        Self::for_size(memory_size(m))
+    }
+
+    /// This message's budget: `prompt · h / (h + q)`, `q` = its useful words.
+    pub fn for_prompt(&self, prompt: &str) -> usize {
+        let q = text::tokens(prompt).len() as f32;
+        (self.prompt as f32 * SPECIFICITY_HALF / (SPECIFICITY_HALF + q)).round() as usize
+    }
+}
+
+/// `S`: what injecting every memory would cost (not plans, not obsolete, not session logs):
+/// its text, its path and the fixed part of the line. Proposals count: reading their files
+/// injects them, and without them a small memory would leave no room for them there.
+pub fn memory_size(m: &Memory) -> usize {
+    m.nodes
+        .iter()
+        .filter(|n| !n.has(flags::POTENTIAL) && !n.has(flags::STALE) && n.kind != NodeKind::Session)
+        .map(|n| line_cost(injected_text(n), &n.path))
+        .sum()
+}
+
+/// Tokens one memory takes when injected.
+pub fn line_cost(text: &str, path: &str) -> usize {
+    text::approx_tokens(text) + text::approx_tokens(path) + LINE_OVERHEAD
+}
+
+fn tokens_of(m: &Memory, scores: &[Score], ids: &[u32]) -> usize {
+    ids.iter().map(|&id| text::approx_tokens(&render_node(m, scores, &m.nodes[id as usize]))).sum()
+}
+
+/// A proposal (`PROPOSED`, a correction captured by heuristics and not confirmed) is injected
+/// only when one of its files is read (`read`): anchored at that file or at a folder holding it.
+/// Never in the core, never from a message, never pulled in by its neighbours.
+pub fn may_inject(n: &Node, read: Option<&str>) -> bool {
+    !n.has(flags::PROPOSED) || read.is_some_and(|p| !n.path.is_empty() && spatial::is_ancestor_or_self(&n.path, p))
+}
+
+/// What the project memory may still inject in this conversation.
+fn remaining(b: &Budgets, session: &SessionState) -> usize {
+    b.conversation.saturating_sub(session.spent as usize)
+}
 
 /// Parsed fields from Claude Code's hook `stdin` JSON payload.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -27,10 +123,12 @@ pub struct HookInput {
     pub cwd: String,
     pub prompt: String,
     pub file_path: String,
+    /// `Stop`: the conversation so far, where the user's corrections are read.
+    pub transcript_path: String,
 }
 
 impl HookInput {
-    /// Extracts `session_id`, `cwd`, `prompt`, and `tool_input.file_path` from a JSON payload.
+    /// Extracts `session_id`, `cwd`, `prompt`, `tool_input.file_path` and `transcript_path` from a JSON payload.
     pub fn parse(json: &str) -> Self {
         let session_id = extract_str(json, "session_id").unwrap_or_else(|| "default".to_string());
         let cwd = extract_str(json, "cwd").unwrap_or_default();
@@ -44,6 +142,7 @@ impl HookInput {
             cwd,
             prompt,
             file_path,
+            transcript_path: extract_str(json, "transcript_path").unwrap_or_default(),
         }
     }
 }
@@ -59,6 +158,8 @@ pub struct SessionState {
     pub turn: i64,
     /// The once-per-conversation forgetting step already ran.
     pub started: bool,
+    /// Tokens the project memory injected in this conversation (capped by `Budgets::conversation`).
+    pub spent: u64,
     /// Rule files the agent already loads by itself (`CLAUDE.md`, `AGENTS.md`…): memories
     /// imported from them are never injected again. Set by the caller; not saved.
     pub native: Vec<String>,
@@ -72,6 +173,7 @@ impl SessionState {
             offset: 0,
             turn: -1,
             started: false,
+            spent: 0,
             native: Vec::new(),
         }
     }
@@ -115,12 +217,13 @@ impl SessionState {
     pub fn encode(&self) -> String {
         let nums: Vec<String> = self.injected.iter().map(|n| n.to_string()).collect();
         format!(
-            "{{\"session_id\":\"{}\",\"injected\":[{}],\"offset\":{},\"turn\":{},\"started\":{}}}\n",
+            "{{\"session_id\":\"{}\",\"injected\":[{}],\"offset\":{},\"turn\":{},\"started\":{},\"spent\":{}}}\n",
             escape_json(&self.session_id),
             nums.join(","),
             self.offset,
             self.turn,
-            self.started
+            self.started,
+            self.spent
         )
     }
 
@@ -134,6 +237,7 @@ impl SessionState {
             offset: num("offset").unwrap_or(0.0) as u64,
             turn: num("turn").unwrap_or(-1.0) as i64,
             started: v.get("started") == Some(&crate::json::Json::Bool(true)),
+            spent: num("spent").unwrap_or(0.0) as u64,
             native: Vec::new(),
         })
     }
@@ -235,7 +339,7 @@ pub fn format_bands(heading: &str, m: &Memory, scores: &[Score], ids: &[u32]) ->
     out
 }
 
-/// Runs `session-start`: one forgetting step, then injects `CORE` nodes within `BUDGET_CORE`.
+/// Runs `session-start`: one forgetting step, then injects `CORE` nodes within `Budgets::core`.
 pub fn handle_session_start(m: &mut Memory, view: &View, session: &mut SessionState) -> String {
     handle_session_start_layered(m, view, session, None)
 }
@@ -266,6 +370,7 @@ pub const DUPLICATE_OF_GLOBAL: f32 = 0.5;
 /// budget left, skipping project rules that repeat a global one.
 pub fn handle_session_start_layered(m: &mut Memory, view: &View, session: &mut SessionState, global: Option<&Memory>) -> String {
     session.injected.clear();
+    session.spent = 0;
     learn::begin_session(m);
     session.started = true;
     core_context(m, view, session, global)
@@ -273,21 +378,45 @@ pub fn handle_session_start_layered(m: &mut Memory, view: &View, session: &mut S
 
 /// The `CORE` text (global layer, then the project's) without starting a session: for agents
 /// whose injected context only lasts one turn and must be given again on the next one.
+/// When `S ≤ WHOLE_MAX`, a small memory goes in whole: `CORE` first, then the remaining
+/// injectable nodes by χ, within `max(budgets.core, S)`.
 pub fn core_context(m: &mut Memory, view: &View, session: &mut SessionState, global: Option<&Memory>) -> String {
-    let (global_out, used, global_toks) = global.map(|g| global_core(g, BUDGET_CORE)).unwrap_or_default();
+    let (global_out, _, global_toks) = global.map(|g| global_core(g, GLOBAL_CORE_MAX)).unwrap_or_default();
+    let budgets = Budgets::of(m);
     let scores = score::score_all(m, view);
-    let candidates: Vec<u32> = retrieve::core(m, &scores)
+    let mut base = retrieve::core(m, &scores);
+    if budgets.size <= WHOLE_MAX {
+        let mut rest: Vec<u32> = m
+            .nodes
+            .iter()
+            .filter(|n| {
+                !n.has(flags::CORE)
+                    && scores[n.id as usize].visible
+                    && !n.has(flags::POTENTIAL)
+                    && !n.has(flags::STALE)
+                    && n.kind != NodeKind::Session
+                    && !n.has(flags::PROPOSED)
+            })
+            .map(|n| n.id)
+            .collect();
+        rest.sort_by(|&a, &b| scores[b as usize].chi.partial_cmp(&scores[a as usize].chi).unwrap_or(std::cmp::Ordering::Equal));
+        base.extend(rest);
+    }
+    let candidates: Vec<u32> = base
         .into_iter()
-        .filter(|&id| !session.was_injected(id) && !session.is_native(&m.nodes[id as usize]))
+        .filter(|&id| !session.was_injected(id) && !session.is_native(&m.nodes[id as usize]) && may_inject(&m.nodes[id as usize], None))
         .filter(|&id| {
             let toks = text::tokens(&m.nodes[id as usize].text);
             !global_toks.iter().any(|g| text::similarity(&toks, g) >= DUPLICATE_OF_GLOBAL)
         })
         .collect();
-    let ids = retrieve::fit_budget(m, &candidates, BUDGET_CORE.saturating_sub(used), |n| render_node(m, &scores, n));
+    let cap = if budgets.size <= WHOLE_MAX { budgets.core.max(budgets.size) } else { budgets.core };
+    let budget = cap.min(remaining(&budgets, session));
+    let ids = retrieve::fit_budget(m, &candidates, budget, |n| render_node(m, &scores, n));
     if ids.is_empty() {
         return global_out;
     }
+    session.spent += tokens_of(m, &scores, &ids) as u64;
     session.record(&ids);
     for &id in &ids {
         if let Some(n) = m.node_mut(id) {
@@ -297,9 +426,9 @@ pub fn core_context(m: &mut Memory, view: &View, session: &mut SessionState, glo
     }
     let mut out = format_bands("## Reglas del proyecto (siempre)", m, &scores, &ids);
     // Never drop core rules silently: the agent should know some are missing.
-    let missing = candidates.len() - ids.len();
-    if missing > 0 {
-        out.push_str(&format!("\n({missing} reglas del núcleo no caben aquí; `cthg core` las muestra todas)"));
+    let missing_core = candidates.iter().filter(|&&id| m.nodes[id as usize].has(flags::CORE) && !ids.contains(&id)).count();
+    if missing_core > 0 {
+        out.push_str(&format!("\n({missing_core} reglas del núcleo no caben aquí; `cthg core` las muestra todas)"));
     }
     if global_out.is_empty() {
         out
@@ -308,7 +437,8 @@ pub fn core_context(m: &mut Memory, view: &View, session: &mut SessionState, glo
     }
 }
 
-/// Runs `prompt`: fuses lexical and `git status`/`git diff` spatial channels within `BUDGET_PROMPT`.
+/// Runs `prompt`: fuses lexical and `git status`/`git diff` spatial channels within the
+/// message's budget (`Budgets::for_prompt`) and what is left of the conversation's.
 pub fn handle_prompt(
     m: &mut Memory,
     view: &View,
@@ -321,18 +451,21 @@ pub fn handle_prompt(
     let candidates: Vec<u32> = retrieve::recall(m, &scores, &q, 40, -1.0)
         .into_iter()
         .map(|r| r.id)
-        .filter(|&id| !session.was_injected(id) && !session.is_native(&m.nodes[id as usize]))
+        .filter(|&id| !session.was_injected(id) && !session.is_native(&m.nodes[id as usize]) && may_inject(&m.nodes[id as usize], None))
         .collect();
-    let ids = retrieve::fit_budget(m, &candidates, BUDGET_PROMPT, |n| render_node(m, &scores, n));
+    let budgets = Budgets::of(m);
+    let budget = budgets.for_prompt(prompt).min(remaining(&budgets, session));
+    let ids = retrieve::fit_budget(m, &candidates, budget, |n| render_node(m, &scores, n));
     if ids.is_empty() {
         return String::new();
     }
+    session.spent += tokens_of(m, &scores, &ids) as u64;
     session.record(&ids);
     learn::co_recalled(m, &ids);
     format_bands("## Memoria relevante", m, &scores, &ids)
 }
 
-/// Runs `read`: just-in-time spatial recall for `rel_path` within `BUDGET_READ`, wrapped in
+/// Runs `read`: just-in-time spatial recall for `rel_path` within `Budgets::read`, wrapped in
 /// `PostToolUse` `hookSpecificOutput.additionalContext` JSON.
 pub fn handle_read(m: &mut Memory, view: &View, session: &mut SessionState, rel_path: &str) -> String {
     let context = read_context(m, view, session, rel_path);
@@ -342,8 +475,9 @@ pub fn handle_read(m: &mut Memory, view: &View, session: &mut SessionState, rel_
     format_post_tool_use(&context)
 }
 
-/// The plain context `read` injects (what `handle_read` wraps in JSON); `eval` counts its tokens.
-pub fn read_context(m: &mut Memory, view: &View, session: &mut SessionState, rel_path: &str) -> String {
+/// Shared just-in-time spatial recall for a file just read or written (`Budgets::read`, per-session
+/// deduplication, proposals allowed for that file).
+fn file_context(m: &mut Memory, view: &View, session: &mut SessionState, rel_path: &str, suffix: &str) -> String {
     let rel_path = spatial::normalize(rel_path);
     if rel_path.is_empty() {
         return String::new();
@@ -356,16 +490,31 @@ pub fn read_context(m: &mut Memory, view: &View, session: &mut SessionState, rel
     let candidates: Vec<u32> = retrieve::recall(m, &scores, &q, 40, -1.0)
         .into_iter()
         .map(|r| r.id)
-        .filter(|&id| !session.was_injected(id) && !session.is_native(&m.nodes[id as usize]))
+        .filter(|&id| !session.was_injected(id) && !session.is_native(&m.nodes[id as usize]) && may_inject(&m.nodes[id as usize], Some(&rel_path)))
         .collect();
-    let ids = retrieve::fit_budget(m, &candidates, BUDGET_READ, |n| render_node(m, &scores, n));
+    let budgets = Budgets::of(m);
+    let budget = budgets.read.min(remaining(&budgets, session));
+    let ids = retrieve::fit_budget(m, &candidates, budget, |n| render_node(m, &scores, n));
     if ids.is_empty() {
         return String::new();
     }
+    session.spent += tokens_of(m, &scores, &ids) as u64;
     session.record(&ids);
     learn::co_recalled(m, &ids);
-    let heading = format!("## Memoria relevante ({rel_path})");
+    let heading = format!("## Memoria relevante ({rel_path}{suffix})");
     format_bands(&heading, m, &scores, &ids)
+}
+
+/// The plain context `read` injects (what `handle_read` wraps in JSON); `eval` counts its tokens.
+pub fn read_context(m: &mut Memory, view: &View, session: &mut SessionState, rel_path: &str) -> String {
+    file_context(m, view, session, rel_path, "")
+}
+
+/// Boosts activation for `rel_path` (`handle_edit`) and injects any of that file's rules not yet
+/// injected in this session, with the same `read` budget, deduplication and proposal rules.
+pub fn edit_context(m: &mut Memory, view: &View, session: &mut SessionState, rel_path: &str) -> String {
+    handle_edit(m, rel_path);
+    file_context(m, view, session, rel_path, ", que acabas de escribir")
 }
 
 /// Runs `edit`: boosts activation on nodes anchored at `rel_path` or its ancestor directories.
@@ -492,6 +641,8 @@ mod tests {
         assert_eq!(input.cwd, r"C:\repo\demo");
         assert_eq!(input.file_path, r"C:\repo\demo\src\core\collider.rs");
         assert_eq!(relativize_path(Path::new(r"C:\repo\demo"), &input.file_path), "src/core/collider.rs");
+        let stop = HookInput::parse(r#"{"session_id":"s","transcript_path":"C:\\u\\.claude\\projects\\p\\s.jsonl","hook_event_name":"Stop","stop_hook_active":false}"#);
+        assert_eq!(stop.transcript_path, r"C:\u\.claude\projects\p\s.jsonl");
 
         let out = format_post_tool_use("## Memoria\n- #1 regla: No uses \"unwrap\"");
         assert!(out.starts_with(r#"{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"#));
@@ -506,6 +657,10 @@ mod tests {
         let core_id = learn(&mut m, &core_claim, 100.0)[0].node;
         let col_id = learn(&mut m, &Claim::rule("No uses unwrap en el colisionador", "src/core/collider.rs"), 101.0)[0].node;
         let dir_id = learn(&mut m, &Claim::rule("Todo el núcleo es determinista", "src/core"), 102.0)[0].node;
+        // Pad memory so S > WHOLE_MAX (300) to test large memory behavior where non-core rules are not injected at session start.
+        learn(&mut m, &Claim::rule(&"alfa ".repeat(200), "src/padding_one"), 105.0);
+        learn(&mut m, &Claim::rule(&"beta ".repeat(200), "src/padding_two"), 106.0);
+        learn(&mut m, &Claim::rule(&"gamma ".repeat(200), "src/padding_three"), 107.0);
 
         let view = View::all();
         let mut session = SessionState::new("s-test");
@@ -624,6 +779,71 @@ mod tests {
         let mut claude = SessionState::new("c");
         claude.native = vec!["CLAUDE.md".into()];
         assert!(handle_session_start(&mut m, &View::all(), &mut claude).contains("push directo"));
+    }
+
+    #[test]
+    fn budgets_scale_with_the_memory_and_level_off() {
+        // A 1 265-token AGENTS.md gets more CORE than the old fixed 500 asked for in proportion,
+        // and a 12 800-token one (three .md files of a real project) more, but never past the ceiling.
+        let small = Budgets::for_size(1265);
+        let large = Budgets::for_size(12800);
+        let huge = Budgets::for_size(200_000);
+        assert_eq!((small.core, small.prompt, small.read), (686, 775, 407));
+        assert_eq!((large.core, large.prompt, large.read), (1343, 1730, 573));
+        assert!(huge.core < CORE_CEIL as usize && huge.core > large.core);
+        assert_eq!((small.conversation, large.conversation), (2000, 12800));
+        // The vaguer the message, the more memory it gets.
+        assert_eq!(small.for_prompt("arréglalo"), 715);
+        let long = "el panel de detalle muestra mal el origen del nodo cuando el grafo tiene muchas aristas de causa y contradicción";
+        assert!(small.for_prompt(long) < small.prompt * 3 / 5, "{}", small.for_prompt(long));
+        // A tiny memory fits whole: below the floors nothing is cut.
+        let tiny = Budgets::for_size(120);
+        assert_eq!((tiny.core, tiny.prompt, tiny.read), (120, 120, 120));
+    }
+
+    #[test]
+    fn a_conversation_never_injects_more_than_the_memory_it_replaces() {
+        let mut m = Memory::default();
+        for i in 0..30 {
+            let words: Vec<String> = ["alfa", "beta", "gamma", "delta", "epsilon", "zeta"].iter().map(|w| format!("{w}{i}")).collect();
+            learn(&mut m, &Claim::rule(&words.join(" "), &format!("src/m{i}.rs")), 1.0 + i as f64);
+        }
+        let b = Budgets::of(&m);
+        let mut session = SessionState::new("cap");
+        let mut total = 0;
+        for i in 0..30 {
+            total += text::approx_tokens(&read_context(&mut m, &View::all(), &mut session, &format!("src/m{i}.rs")));
+        }
+        assert!(session.spent as usize <= b.conversation, "{} > {}", session.spent, b.conversation);
+        assert!(total > 0);
+        let encoded = session.encode();
+        assert_eq!(SessionState::decode(&encoded).unwrap().spent, session.spent);
+    }
+
+    #[test]
+    fn writing_a_file_without_reading_it_injects_its_rules_once_and_reading_after_does_not_repeat() {
+        let mut m = Memory::default();
+        let file_id = learn(&mut m, &Claim::rule("En src/id.rs los ids son base36 de 4 caracteres", "src/id.rs"), 100.0)[0].node;
+        let dir_id = learn(&mut m, &Claim::rule("Todo src/ usa solo la biblioteca estándar", "src"), 101.0)[0].node;
+        m.nodes[file_id as usize].activation = 0.4;
+        m.nodes[dir_id as usize].activation = 0.4;
+
+        let view = View::all();
+        let mut session = SessionState::new("edit-first");
+
+        // Writing `src/id.rs` without having read it refreshes activation and injects its rules once.
+        let e_out = edit_context(&mut m, &view, &mut session, "src/id.rs");
+        assert!(e_out.starts_with("## Memoria relevante (src/id.rs, que acabas de escribir)"), "{e_out}");
+        assert!(e_out.contains("base36 de 4 caracteres"), "{e_out}");
+        assert!(e_out.contains("solo la biblioteca estándar"), "{e_out}");
+        assert_eq!(m.nodes[file_id as usize].activation, 1.0);
+        assert_eq!(m.nodes[dir_id as usize].activation, 1.0);
+        assert!(session.was_injected(file_id) && session.was_injected(dir_id));
+
+        // Writing it again or reading it afterwards does not repeat the already-injected rules.
+        assert!(edit_context(&mut m, &view, &mut session, "src/id.rs").is_empty());
+        assert!(read_context(&mut m, &view, &mut session, "src/id.rs").is_empty());
+        assert!(handle_read(&mut m, &view, &mut session, "src/id.rs").is_empty());
     }
 }
 

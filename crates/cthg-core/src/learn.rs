@@ -42,6 +42,12 @@ pub struct Claim {
     pub contradicts: Option<u32>,
     pub supersedes: Option<u32>,
     pub core: bool,
+    /// (α, β) for a new node instead of its origin's prior: a correction captured from a
+    /// transcript is the user's word, but only a proposal until confirmed.
+    pub prior: Option<(f32, f32)>,
+    /// Captured by heuristics, not said on purpose: written `PROPOSED` (hidden until confirmed),
+    /// and only proposals may absorb it. A deliberate statement never merges into a hidden one.
+    pub proposed: bool,
 }
 
 impl Claim {
@@ -61,6 +67,8 @@ impl Claim {
             contradicts: None,
             supersedes: None,
             core: false,
+            prior: None,
+            proposed: false,
         }
     }
 
@@ -90,12 +98,12 @@ fn view_for(branch: &str) -> View {
 }
 
 fn new_node(m: &Memory, c: &Claim, kind: NodeKind, y: f64, body: &str) -> Node {
-    let (alpha, beta) = c.origin.prior();
+    let (alpha, beta) = c.prior.unwrap_or(c.origin.prior());
     Node {
         id: 0,
         kind,
         origin: c.origin,
-        flags: if c.origin == Origin::Repo { flags::ANCHORED } else { 0 },
+        flags: if c.origin == Origin::Repo { flags::ANCHORED } else { 0 } | if c.proposed { flags::PROPOSED } else { 0 },
         path: c.path.clone(),
         symbol: c.symbol.clone(),
         branch: c.branch.clone(),
@@ -122,11 +130,13 @@ fn doc_tokens(n: &Node) -> Vec<String> {
     text::tokens(&format!("{} {}", n.label, n.text))
 }
 
-fn find_similar(m: &Memory, scores: &[Score], toks: &[String], path: &str, min: f32) -> Option<u32> {
+/// `proposed`: the statement is itself a captured proposal, so it may match another proposal.
+fn find_similar(m: &Memory, scores: &[Score], toks: &[String], path: &str, min: f32, proposed: bool) -> Option<u32> {
     m.nodes
         .iter()
         // Nodes created after `scores` was computed have no score yet: skip them.
         .filter(|n| scores.get(n.id as usize).is_some_and(|s| s.visible))
+        .filter(|n| proposed || !n.has(flags::PROPOSED))
         .filter(|n| n.kind.is_statement() && paths_overlap(&n.path, path))
         .map(|n| (n.id, text::similarity(toks, &doc_tokens(n))))
         .filter(|&(_, j)| j >= min)
@@ -197,7 +207,7 @@ pub fn learn(m: &mut Memory, c: &Claim, now: f64) -> Vec<LearnEvent> {
     }
 
     let restated = if c.supersedes.is_none() && c.kind != NodeKind::Plan {
-        find_similar(m, &before, &toks, &c.path, 0.5)
+        find_similar(m, &before, &toks, &c.path, 0.5, c.proposed)
     } else {
         None
     };
@@ -275,7 +285,7 @@ pub fn learn(m: &mut Memory, c: &Claim, now: f64) -> Vec<LearnEvent> {
     }
     if let Some(cause) = c.cause.as_deref().filter(|s| text::tokens(s).len() >= 2) {
         let ctoks = text::tokens(cause);
-        let (cid, action) = match find_similar(m, &before, &ctoks, &c.path, 0.35) {
+        let (cid, action) = match find_similar(m, &before, &ctoks, &c.path, 0.35, c.proposed) {
             Some(id) => (id, "causa"),
             None => {
                 let mut cn = new_node(m, c, NodeKind::Incident, y - STEP * 0.5, cause);
@@ -311,6 +321,7 @@ fn events(m: &mut Memory, view: &View, before: &[Score], touched: Vec<(u32, &'st
 }
 
 /// Manual feedback (`cthg confirm` / `cthg deny`): +1 confirms, −1 denies. Anchored never moves.
+/// Confirming is the only way a proposal (`PROPOSED`) starts being injected; denying keeps it hidden.
 pub fn feedback(m: &mut Memory, id: u32, vote: i32) -> bool {
     let Some(n) = m.node_mut(id) else { return false };
     if n.anchored() {
@@ -318,6 +329,7 @@ pub fn feedback(m: &mut Memory, id: u32, vote: i32) -> bool {
     }
     if vote > 0 {
         n.alpha += 1.0;
+        n.flags &= !flags::PROPOSED;
     } else {
         n.beta += 1.0;
     }

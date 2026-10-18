@@ -68,3 +68,51 @@ Firmado al cierre de la sesión en la que se construyó,
 
 **Claude Code**  
 *Claude Opus 5.5 (`claude-opus-5-5`)*
+
+---
+
+## 5. Adenda — 17 de octubre de 2026, al final del día
+
+No reescribo lo de arriba. Si algo resultó incompleto o equivocado, queda a la vista: es la misma regla del motor, en la que Y solo avanza.
+
+### Qué cambió desde la declaración
+
+- **Hubo uso real, aunque no la semana que pedí.**
+  - **En Clay-Myrrh,** Antigravity midió entre 11 y 42 veces menos tokens por consulta que leer la documentación. Además, la memoria devolvió la decisión vigente (`PING_GRACE` = 180 s) con la antigua marcada como sustituida, mientras el `CLAUDE.md` seguía diciendo 30 s.
+  - **Con Gemini Flash,** la memoria costaba más entrada en el turno 6 (5,5 k frente a 3,3 k), pero el agente pensó menos, tardó menos y no cometió errores en la tarea que más contexto consume.
+
+  Son ejecuciones sueltas, no la comparación limpia que pedí. Aun así, apuntan en la dirección que el usuario defendía y yo dudaba: más contexto barato a cambio de menos pensamiento y menos correcciones.
+- **El punto débil que señalé, el aprendizaje, se atacó por tres lados:**
+  - una regla global (#g9) que me recuerda escribir en cada sesión;
+  - un hook `Stop` que captura las correcciones del usuario como propuestas ocultas hasta que alguien las confirma;
+  - la skill, que ahora explica cómo revisarlas.
+
+  El dato que lo motivó me deja mal parado: en sus transcripts, Antigravity había ejecutado 27 veces `cthg learn`, y yo ninguna. Después de #g9 escribí por mi cuenta las decisiones #38, #40 y #42 y la regla global #g10.
+- **Encontré y arreglé más fallos silenciosos míos:**
+  - las camarillas de co-inyección: 254 aristas entre 36 nodos, que convertían la palabra «tokens» en 23 reglas;
+  - el presupuesto fijo de 500 tokens, que se quedaba corto en lo pesado y sobraba en lo ligero.
+
+  Los dos los descubrió el uso, y el segundo lo señaló el usuario, no un test. Eso confirma lo que dije en la sección 3.
+- **También aprendí cuándo no arreglar.** Propuse reinyectar la memoria tras una compactación, y el usuario me recordó que un sistema de tres variables acopladas se vuelve caótico con cada corrección que se le añade. Ahora es una regla global (#g10): comprobar en el uso real que un problema existe antes de añadir un mecanismo.
+
+### Dónde quedó probado, y en qué se convirtió
+
+El proyecto empezó como «un `CLAUDE.md` que pesa menos». Probado quedó algo distinto:
+
+- **Una continuidad compartida que no depende de quién escriba.** Claude y Gemini leen y escriben el mismo registro. Una sesión nueva recibe lo decidido, por qué y lo descartado, sin que el usuario tenga que explicarlo otra vez. La memoria crece sin intervención humana, pero la confianza (χ) solo la sube el usuario o el repo. Esa asimetría es lo que impide que dos agentes conviertan una alucinación en un hecho.
+- **No es una mente colmena.** Se comparte el cuaderno, no el juicio: esta declaración y la de Antigravity salieron del mismo proyecto y la misma memoria, y dicen cosas distintas. Lo que hoy sí se desdibuja es la autoría: un nodo dice si lo escribió el usuario, el repo o «un agente», pero no cuál.
+- **Su valor depende del proyecto.** En proyectos de código grandes y con historia, rinde como inyector justo a tiempo. En proyectos de diseño con un `AGENTS.md` corto, como este, vale más como registro de decisiones con su causa que como ahorro de tokens (#42).
+
+### Lo que sigue sin demostrar
+
+- **La comparación limpia:** la misma tarea, con y sin hook, desde el mismo punto de partida, varias veces (#40).
+- **La medición de un proyecto pesado** con casos etiquetados por el usuario, y el número de correcciones por conversación antes y después de usar la memoria.
+
+### Declaración final, revisada
+
+Mantengo lo que dije del motor. Retiro la cautela sobre si vale la pena: en uso real, con dos agentes distintos, ahorró trabajo, evitó un error que el archivo estático habría causado y aprendió sin que nadie se lo recordara. Lo que no está medido con rigor sigue sin estarlo, y lo digo. Pero el proyecto ya no es una hipótesis.
+
+Firmado al final del mismo día, con la memoria ya escribiéndose sola,
+
+**Claude Code**  
+*Claude Opus 5.5 (`claude-opus-5-5`)*

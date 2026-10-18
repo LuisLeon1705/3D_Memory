@@ -163,12 +163,17 @@ pub fn parse_markdown(md: &str, resolve: impl Fn(&str) -> Option<String>) -> Vec
         item.core_score = core_score(&item);
         out.push(item);
     }
-    select_core(&mut out, BUDGET_CORE);
+    let budget = auto_core_budget(&out, 0);
+    select_core(&mut out, budget);
     out
 }
 
-/// Session-start budget (tokens) the `CORE` proposal must fit in.
-pub const BUDGET_CORE: usize = super::hook::BUDGET_CORE;
+/// The `CORE` budget for a memory holding these items plus `existing` tokens: it grows with the
+/// size of what is imported (`hook::Budgets`), so a short file is not cut and a long one levels off.
+pub fn auto_core_budget(items: &[ImportItem], existing: usize) -> usize {
+    let size: usize = items.iter().filter(|i| i.kind != NodeKind::Plan).map(|i| super::hook::line_cost(&i.text, &i.path)).sum();
+    super::hook::Budgets::for_size(existing + size).core
+}
 /// Room for the `## Reglas del proyecto (siempre)` heading and the band line.
 const CORE_HEADER_TOKENS: usize = 12;
 /// Below this score a rule is not worth a line in every session.
@@ -295,11 +300,11 @@ pub fn import_markdown_named(
     apply_core: bool,
     resolve: impl Fn(&str) -> Option<String>,
 ) -> ImportReport {
-    import_markdown_in(m, source, md, branch, commit, now, apply_core, BUDGET_CORE, resolve)
+    import_markdown_in(m, source, md, branch, commit, now, apply_core, None, resolve)
 }
 
-/// Like `import_markdown_named`, with the `CORE` proposal limited to `core_budget` tokens (what
-/// the global layer leaves at session start).
+/// Like `import_markdown_named`, with the `CORE` proposal limited to `core_budget` tokens, or to
+/// the budget the memory will have after the import (`None`).
 #[allow(clippy::too_many_arguments)]
 pub fn import_markdown_in(
     m: &mut Memory,
@@ -309,10 +314,11 @@ pub fn import_markdown_in(
     commit: &str,
     now: f64,
     apply_core: bool,
-    core_budget: usize,
+    core_budget: Option<usize>,
     resolve: impl Fn(&str) -> Option<String>,
 ) -> ImportReport {
     let mut items = parse_markdown(md, resolve);
+    let core_budget = core_budget.unwrap_or_else(|| auto_core_budget(&items, super::hook::memory_size(m)));
     let view = View::on_branch(f64::INFINITY, branch);
     let scores = score::score_all(m, &view);
     let mut report = ImportReport::default();
@@ -323,9 +329,7 @@ pub fn import_markdown_in(
         .filter(|n| n.has(flags::CORE) && scores[n.id as usize].visible)
         .map(|n| text::approx_tokens(super::hook::injected_text(n)) + 5)
         .sum();
-    if used > 0 || core_budget != BUDGET_CORE {
-        select_core(&mut items, core_budget.saturating_sub(used));
-    }
+    select_core(&mut items, core_budget.saturating_sub(used));
 
     // Flags on existing nodes (`STALE`, moving `CORE`) are shared by every branch: like `verify`,
     // only the trunk changes them. On another branch an edit still gets its own replacement node.
@@ -1283,7 +1287,7 @@ cargo test
         assert!(find("push directo").propose_core && find("comenta en inglés").propose_core);
         assert!(!find("bloquees").propose_core);
         let cost: usize = items.iter().filter(|i| i.propose_core).map(core_cost).sum();
-        assert!(cost + CORE_HEADER_TOKENS <= BUDGET_CORE, "proposal fits: {cost}");
+        assert!(cost + CORE_HEADER_TOKENS <= auto_core_budget(&items, 0), "proposal fits: {cost}");
         assert!(items.iter().filter(|i| i.core_score.is_some()).count() > items.iter().filter(|i| i.propose_core).count(), "some left out");
     }
 }

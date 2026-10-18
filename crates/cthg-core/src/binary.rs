@@ -17,7 +17,11 @@ use std::path::Path;
 
 pub const MAGIC: &[u8; 4] = b"CTHG";
 /// 2: flag bit 4 (`STALE`) exists. Same layout as 1, so version 1 files still load.
-pub const VERSION: u16 = 2;
+/// 3: flag bit 5 (`PROPOSED`) exists. Same layout again; a file is written as 3 only when a
+/// node carries that bit, so readers of version 2 still open every memory without proposals.
+pub const VERSION: u16 = 3;
+/// What a memory without the newest flags is written as.
+const VERSION_WITHOUT_PROPOSALS: u16 = 2;
 pub const OLDEST_READABLE: u16 = 1;
 
 fn crc32(data: &[u8]) -> u32 {
@@ -181,7 +185,8 @@ pub fn encode(m: &Memory) -> Vec<u8> {
 
     let mut out = W::default();
     out.0.extend_from_slice(MAGIC);
-    out.u16(VERSION);
+    let proposals = m.nodes.iter().any(|n| n.has(flags::PROPOSED));
+    out.u16(if proposals { VERSION } else { VERSION_WITHOUT_PROPOSALS });
     out.u16(0);
     out.u32(sections.len() as u32);
     for (tag, body) in &sections {
@@ -362,6 +367,24 @@ mod tests {
         let mut broken = bytes.clone();
         broken[20] ^= 0xFF;
         assert!(decode(&broken).is_err());
+    }
+
+    #[test]
+    fn proposals_round_trip_as_version_3_and_the_rest_stays_version_2() {
+        let mut m = Memory::default();
+        learn(&mut m, &Claim::rule("Los mensajes del CLI van en español", "src"), 1.0);
+        let plain = encode(&m);
+        assert_eq!(u16::from_le_bytes([plain[4], plain[5]]), 2, "no proposal: a version 2 reader still opens it");
+
+        let mut c = Claim::rule("siguen rotas (al pedir «arregla las ventanas»)", "src/ventanas.rs");
+        c.proposed = true;
+        let id = learn(&mut m, &c, 2.0)[0].node;
+        let bytes = encode(&m);
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 3);
+        let back = decode(&bytes).unwrap();
+        assert!(back.nodes[id as usize].has(flags::PROPOSED));
+        assert!(!back.nodes[0].has(flags::PROPOSED));
+        assert_eq!(encode(&back), bytes, "re-encoding is byte-identical");
     }
 
     #[test]

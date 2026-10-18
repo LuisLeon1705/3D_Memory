@@ -8,8 +8,8 @@
 //! - read only the transcript lines added since the last call (`SessionState::offset`);
 //! - a new `USER_INPUT` step starts a turn: inject the `CORE` and what the message and the
 //!   working tree recall (the injected context of the previous turn is gone by then);
-//! - each new `view_file` injects that file's rules once per turn;
-//! - each `write_to_file` / `replace_file_content` refreshes that area of the memory.
+//! - each new `view_file` injects that file's rules once;
+//! - each `write_to_file` / `replace_file_content` refreshes that area and injects its rules once.
 
 use super::json::Json;
 
@@ -36,6 +36,8 @@ pub fn parse_payload(raw: &str) -> Payload {
 pub enum Step {
     /// The user wrote this (tags like `<USER_REQUEST>` removed).
     User { index: i64, text: String },
+    /// Another agent sent this message (`SYSTEM_MESSAGE` with `[Message]` and a sender without `/task-`).
+    Agent { index: i64, text: String, sender: String },
     /// The agent read this file (absolute path as the agent gave it).
     Read(String),
     /// The agent wrote or edited this file.
@@ -54,30 +56,65 @@ pub fn user_request(content: &str) -> String {
     inner.trim().to_string()
 }
 
+/// Extracts `(sender, text)` from an inter-agent `<SYSTEM_MESSAGE>`: must carry `[Message]` and
+/// a `sender=` without `/task-` (background task notifications use `<conv>/task-<n>`).
+pub fn agent_message(content: &str) -> Option<(String, String)> {
+    let (_, inner) = content.rsplit_once("<SYSTEM_MESSAGE>")?;
+    let body = inner.split("</SYSTEM_MESSAGE>").next().unwrap_or(inner).trim();
+    let rest = body.strip_prefix("[Message]")?;
+    let (_, after_sender) = rest.split_once("sender=")?;
+    let sender = after_sender.split_whitespace().next()?.trim();
+    if sender.is_empty() || sender.contains("/task-") {
+        return None;
+    }
+    let (_, msg) = after_sender.split_once("content=")?;
+    let text = msg.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some((sender.to_string(), text.to_string()))
+}
+
 /// Parses complete transcript lines (a half-written last line is left for the next call).
 /// Returns the steps and how many bytes were consumed.
 pub fn scan(text: &str) -> (Vec<Step>, usize) {
     let consumed = text.rfind('\n').map(|i| i + 1).unwrap_or(0);
     let mut steps = Vec::new();
     for line in text[..consumed].lines() {
-        let Some(v) = Json::parse(line) else { continue };
-        if v.get("type").and_then(Json::str) == Some("USER_INPUT") {
+        if let Some(v) = Json::parse(line) {
+            line_steps(&v, &mut steps);
+        }
+    }
+    (steps, consumed)
+}
+
+/// The steps one transcript line holds: a user or agent message and/or the files its tool calls read or wrote.
+pub fn line_steps(v: &Json, steps: &mut Vec<Step>) {
+    match v.get("type").and_then(Json::str) {
+        Some("USER_INPUT") => {
             let index = v.get("step_index").and_then(Json::num).unwrap_or(-1.0) as i64;
             let text = user_request(v.get("content").and_then(Json::str).unwrap_or(""));
             steps.push(Step::User { index, text });
         }
-        for call in v.get("tool_calls").map(Json::arr).unwrap_or(&[]) {
-            let name = call.get("name").and_then(Json::str).unwrap_or("");
-            let args = call.get("args");
-            let arg = |key: &str| args.and_then(|a| a.get(key)).and_then(Json::str).map(str::to_string);
-            if let Some((_, key)) = READ_TOOLS.iter().find(|(n, _)| *n == name) {
-                steps.extend(arg(key).map(Step::Read));
-            } else if let Some((_, key)) = EDIT_TOOLS.iter().find(|(n, _)| *n == name) {
-                steps.extend(arg(key).map(Step::Edit));
+        Some("SYSTEM_MESSAGE") => {
+            let index = v.get("step_index").and_then(Json::num).unwrap_or(-1.0) as i64;
+            let content = v.get("content").and_then(Json::str).unwrap_or("");
+            if let Some((sender, text)) = agent_message(content) {
+                steps.push(Step::Agent { index, text, sender });
             }
         }
+        _ => {}
     }
-    (steps, consumed)
+    for call in v.get("tool_calls").map(Json::arr).unwrap_or(&[]) {
+        let name = call.get("name").and_then(Json::str).unwrap_or("");
+        let args = call.get("args");
+        let arg = |key: &str| args.and_then(|a| a.get(key)).and_then(Json::str).map(str::to_string);
+        if let Some((_, key)) = READ_TOOLS.iter().find(|(n, _)| *n == name) {
+            steps.extend(arg(key).map(Step::Read));
+        } else if let Some((_, key)) = EDIT_TOOLS.iter().find(|(n, _)| *n == name) {
+            steps.extend(arg(key).map(Step::Edit));
+        }
+    }
 }
 
 /// The hook's stdout: one ephemeral message, or `{}` when there is nothing to add.
@@ -121,6 +158,29 @@ mod tests {
         assert!(TRANSCRIPT[consumed..].starts_with(r#"{"step_index":3"#), "the half-written line waits for the next call");
         let (again, _) = scan(&TRANSCRIPT[consumed..]);
         assert!(again.is_empty());
+    }
+
+    #[test]
+    fn parses_agent_system_message_and_ignores_background_task_notifications() {
+        // Real lines from Worker 1 (`eca37883-a388-4363-8dec-051714e64d28`): step 1 is the boss's
+        // assignment (`sender=580c7845-…`), step 28 is a background `cargo test` task (`sender=…/task-21`).
+        let worker_lines = concat!(
+            r#"{"step_index":1,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","created_at":"2026-10-18T03:26:12Z","content":"The following is a <SYSTEM_MESSAGE> not actually sent by the user. It is provided by the system as important information to pay attention to.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-18T03:26:12Z sender=580c7845-203e-44db-a9d9-f449680aa27d priority=MESSAGE_PRIORITY_HIGH content=Construye `src/id.rs` y `src/storage.rs`.\n\nIncluye los tests unitarios correspondientes.\n</SYSTEM_MESSAGE>"}"#,
+            "\n",
+            r#"{"step_index":28,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","created_at":"2026-10-18T03:26:42Z","content":"The following is a <SYSTEM_MESSAGE> not actually sent by the user. It is provided by the system as important information to pay attention to.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-18T03:26:41Z sender=eca37883-a388-4363-8dec-051714e64d28/task-21 priority=MESSAGE_PRIORITY_HIGH content=Task id \"eca37883-a388-4363-8dec-051714e64d28/task-21\" finished with result:\n\nThe command exited with code 1.\n</SYSTEM_MESSAGE>"}"#,
+            "\n",
+            r#"{"step_index":37,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>sin formato de mensaje</SYSTEM_MESSAGE>"}"#,
+            "\n",
+        );
+        let (steps, _) = scan(worker_lines);
+        assert_eq!(
+            steps,
+            vec![Step::Agent {
+                index: 1,
+                sender: "580c7845-203e-44db-a9d9-f449680aa27d".into(),
+                text: "Construye `src/id.rs` y `src/storage.rs`.\n\nIncluye los tests unitarios correspondientes.".into(),
+            }]
+        );
     }
 
     #[test]

@@ -136,6 +136,9 @@ pub mod flags {
     /// `verify` found that its path, symbol, dependency or command no longer holds.
     /// Structural, not evidence: it sinks χ while set and lifts when `verify` passes again.
     pub const STALE: u8 = 1 << 4;
+    /// A correction captured from a transcript by heuristics: kept, but never injected
+    /// (except when its own files are read) until `cthg confirm` clears it.
+    pub const PROPOSED: u8 = 1 << 5;
 }
 
 #[derive(Clone, Debug)]

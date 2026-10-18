@@ -592,6 +592,16 @@ mod tests {
 - Los botones de `src/ui/` usan el tema oscuro.
 - Los secretos van en el gestor de secretos y jamás en el repositorio.
 - Los botones de `src/ui/` usan el tema oscuro siempre.
+- Regla alfa: los archivos de configuracion usan formato estructurado siempre.
+- Regla beta: los esquemas de datos van versionados con marcas temporales.
+- Regla gamma: la comunicacion entre modulos requiere firmas criptograficas.
+- Regla delta: los certificados deben renovarse de forma automatica.
+- Regla epsilon: todas las respuestas llevan cabeceras estrictas.
+- Regla zeta: la compresion se activa para cargas superiores a un kilobyte.
+- Regla eta: los identificadores de peticion se propagan en cada llamada.
+- Regla theta: la tasa de refresco no supera sesenta fotogramas.
+- Regla iota: los buffers se reutilizan para evitar asignaciones dinamicas.
+- Regla kappa: el hilo principal nunca ejecuta operaciones bloqueantes.
 ";
 
     fn exists(p: &str) -> Option<String> {

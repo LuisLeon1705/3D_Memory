@@ -1,0 +1,6 @@
+Cargo.toml
+src/id.rs
+src/storage.rs
+src/cli.rs
+src/main.rs
+tests/cli_integration.rs
