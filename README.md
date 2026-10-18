@@ -1,6 +1,9 @@
 # 3D-Memory (`cthg`)
 
-Memoria persistente de proyecto para agentes de código (**Claude Code** y **Google Antigravity**), impulsada por un **Causal-Temporal HyperGraph (CTHG)** almacenado en un único archivo binario (`.cthg/memoria.cthg`) sin dependencias externas.
+[![GitHub](https://img.shields.io/badge/GitHub-3D_Memory-24292f?style=flat-square&logo=github)](https://github.com/LuisLeon1705/3D_Memory)
+[![Visualizer](https://img.shields.io/badge/Explorer-3D--Memory--Visualizer-0969da?style=flat-square)](https://github.com/LuisLeon1705/3D-Memory-Visualizer)
+
+Memoria persistente de proyecto para agentes de código (**Claude Code** y **Google Antigravity**), impulsada por un **Causal-Temporal HyperGraph (CTHG)** almacenado en un único archivo binario (`.cthg/memoria.cthg`) sin dependencias externas. Incluye integración nativa con el explorador de constelaciones 3D [`3D-Memory-Visualizer`](https://github.com/LuisLeon1705/3D-Memory-Visualizer).
 
 En lugar de inyectar un `CLAUDE.md` o `AGENTS.md` completo en cada turno, **3D-Memory** inyecta **un núcleo pequeño fijo (`CORE`) + únicamente los recuerdos que aplican a los archivos, símbolos y tarea actuales**, ponderados por ruta, tiempo y confianza.
 
