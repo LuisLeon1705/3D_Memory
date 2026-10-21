@@ -109,7 +109,10 @@ fn tokens_of(m: &Memory, scores: &[Score], ids: &[u32]) -> usize {
 /// A proposal (`PROPOSED`, a correction captured by heuristics and not confirmed) is injected
 /// only when one of its files is read (`read`): anchored at that file or at a folder holding it.
 /// Never in the core, never from a message, never pulled in by its neighbours.
-pub fn may_inject(n: &Node, read: Option<&str>) -> bool {
+pub fn may_inject(n: &Node, score: &Score, read: Option<&str>) -> bool {
+    if score.superseded {
+        return false;
+    }
     !n.has(flags::PROPOSED) || read.is_some_and(|p| !n.path.is_empty() && spatial::is_ancestor_or_self(&n.path, p))
 }
 
@@ -309,7 +312,24 @@ pub fn render_node_with_neighbor(
                 .partial_cmp(&scores[b.from as usize].chi)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
-        .map(|e| &m.nodes[e.from as usize]);
+        .map(|e| {
+            let mut from = e.from;
+            let mut visited = std::collections::HashSet::new();
+            visited.insert(from);
+            while let Some(sub) = m.edges.iter().find(|s| {
+                s.to == from
+                    && s.kind == EdgeKind::Supersedes
+                    && !visited.contains(&s.from)
+                    && scores.get(s.from as usize).is_some_and(|sc| sc.visible && sc.chi > 0.0)
+            }) {
+                from = sub.from;
+                visited.insert(from);
+                if visited.len() > 32 {
+                    break;
+                }
+            }
+            &m.nodes[from as usize]
+        });
     if let Some(c) = cause {
         s.push_str(&format!(" ← {}", text::clip(&c.label, 80)));
     }
@@ -439,7 +459,7 @@ pub fn core_context(m: &mut Memory, view: &View, session: &mut SessionState, glo
     }
     let candidates: Vec<u32> = base
         .into_iter()
-        .filter(|&id| !session.was_injected(id) && !session.is_native(&m.nodes[id as usize]) && may_inject(&m.nodes[id as usize], None))
+        .filter(|&id| !session.was_injected(id) && !session.is_native(&m.nodes[id as usize]) && may_inject(&m.nodes[id as usize], &scores[id as usize], None))
         .filter(|&id| {
             let toks = text::tokens(&m.nodes[id as usize].text);
             !global_toks.iter().any(|g| text::similarity(&toks, g) >= DUPLICATE_OF_GLOBAL)
@@ -517,7 +537,7 @@ pub fn handle_prompt_with_weights(
     let candidates: Vec<u32> = retrieve::recall(m, &scores, &q, 40, -1.0)
         .into_iter()
         .map(|r| r.id)
-        .filter(|&id| !session.was_injected(id) && !session.is_native(&m.nodes[id as usize]) && may_inject(&m.nodes[id as usize], None))
+        .filter(|&id| !session.was_injected(id) && !session.is_native(&m.nodes[id as usize]) && may_inject(&m.nodes[id as usize], &scores[id as usize], None))
         .collect();
     let budgets = Budgets::of(m);
     let budget = budgets.for_prompt(prompt).min(remaining(&budgets, session));
@@ -591,7 +611,7 @@ fn file_context_with_weights(
     let candidates: Vec<u32> = retrieve::recall(m, &scores, &q, 40, -1.0)
         .into_iter()
         .map(|r| r.id)
-        .filter(|&id| !session.was_injected(id) && !session.is_native(&m.nodes[id as usize]) && may_inject(&m.nodes[id as usize], Some(&rel_path)))
+        .filter(|&id| !session.was_injected(id) && !session.is_native(&m.nodes[id as usize]) && may_inject(&m.nodes[id as usize], &scores[id as usize], Some(&rel_path)))
         .collect();
     let budgets = Budgets::of(m);
     let budget = budgets.read.min(remaining(&budgets, session));
@@ -1116,5 +1136,139 @@ mod tests {
         assert!(read_context(&mut m, &view, &mut session, "src/id.rs").is_empty());
         assert!(handle_read(&mut m, &view, &mut session, "src/id.rs").is_empty());
     }
-}
 
+    #[test]
+    fn test_superseded_not_injected_in_any_channel_and_reappears_when_substitute_denied() {
+        use crate::index::{FileEntry, ProjectIndex};
+        use crate::lang_rust::Import;
+        let mut m = Memory::default();
+        let view = View::all();
+
+        // 1. CORE rule: old is CORE, new replaces it
+        let mut old_core_claim = Claim::rule("Presupuestos fijos 500 800", "");
+        old_core_claim.core = true;
+        let old_core = learn(&mut m, &old_core_claim, 100.0)[0].node;
+
+        let mut new_core_claim = Claim::rule("Presupuestos dinámicos según S", "");
+        new_core_claim.core = true;
+        new_core_claim.supersedes = Some(old_core);
+        let ev_core = learn(&mut m, &new_core_claim, 101.0);
+        let new_core = ev_core.iter().find(|e| e.action == "nuevo").unwrap().node;
+
+        // 2. File / neighbor rule: old_file is for src/cli.rs, replaced by new_file
+        let old_file = learn(&mut m, &Claim::rule("CLI antiguo flag viejo", "src/cli.rs"), 102.0)[0].node;
+        let mut new_file_claim = Claim::rule("CLI nuevo flag nuevo", "src/cli.rs");
+        new_file_claim.supersedes = Some(old_file);
+        let ev_file = learn(&mut m, &new_file_claim, 103.0);
+        let new_file = ev_file.iter().find(|e| e.action == "nuevo").unwrap().node;
+
+        // Code index linking src/main.rs -> src/cli.rs as neighbor
+        let mut idx = ProjectIndex::default();
+        idx.files.push(FileEntry {
+            path: "src/main.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 10,
+            mtime: 10,
+            hash: 1,
+            status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![Import { raw: "use cli;".to_string(), resolved: Some("src/cli.rs".to_string()) }],
+            calls: vec![],
+        });
+        idx.files.push(FileEntry {
+            path: "src/cli.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 10,
+            mtime: 10,
+            hash: 2,
+            status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![],
+            calls: vec![],
+        });
+
+        // Test Channel 0: Core context
+        let mut s_core = SessionState::new("s-core");
+        let core_out = core_context(&mut m, &view, &mut s_core, None);
+        assert!(!core_out.contains("Presupuestos fijos 500 800"), "old core must not be injected");
+        assert!(core_out.contains("Presupuestos dinámicos"), "new core must be injected");
+
+        // Test Channel 1 & 3: Prompt / message
+        let mut s_msg = SessionState::new("s-msg");
+        let msg_out = handle_prompt(&mut m, &view, &mut s_msg, "flag viejo o nuevo en CLI", vec![]);
+        assert!(!msg_out.contains("CLI antiguo flag viejo"), "old rule must not be injected in prompt");
+        assert!(msg_out.contains("CLI nuevo flag nuevo"), "new rule must be injected in prompt");
+
+        // Test Channel 2: Read file directly
+        let mut s_read = SessionState::new("s-read");
+        let read_out = read_context(&mut m, &view, &mut s_read, "src/cli.rs");
+        assert!(!read_out.contains("CLI antiguo flag viejo"), "old rule must not be injected in read");
+        assert!(read_out.contains("CLI nuevo flag nuevo"), "new rule must be injected in read");
+
+        // Test Neighbor channel: Reading neighbor src/main.rs pulls src/cli.rs
+        let mut s_neigh = SessionState::new("s-neigh");
+        let neigh_out = read_context_with_index(&mut m, &view, &mut s_neigh, "src/main.rs", Some(&idx));
+        assert!(!neigh_out.contains("CLI antiguo flag viejo"), "old rule must not be injected as neighbor");
+        assert!(neigh_out.contains("CLI nuevo flag nuevo"), "new rule must be injected as neighbor");
+
+        // Now deny the replacement until chi <= 0
+        for _ in 0..10 {
+            learn::feedback(&mut m, new_core, -1);
+            learn::feedback(&mut m, new_file, -1);
+        }
+        let scores = score::score_all(&m, &view);
+        assert!(scores[new_core as usize].chi <= 0.0);
+        assert!(scores[new_file as usize].chi <= 0.0);
+assert!(!scores[old_core as usize].superseded, "old core is no longer superseded");
+        assert!(!scores[old_file as usize].superseded, "old file is no longer superseded");
+
+        // Reappears in core and read!
+        let mut s_core2 = SessionState::new("s-core2");
+        let core_reappear = core_context(&mut m, &view, &mut s_core2, None);
+        assert!(core_reappear.contains("Presupuestos fijos 500 800"), "old core reappears when new is denied");
+
+        let mut s_read2 = SessionState::new("s-read2");
+        let read_reappear = read_context(&mut m, &view, &mut s_read2, "src/cli.rs");
+        assert!(read_reappear.contains("CLI antiguo flag viejo"), "old rule reappears when new is denied");
+    }
+
+    #[test]
+    fn test_anchored_with_supersedes_edge_continues_to_be_injected() {
+        let mut m = Memory::default();
+        let view = View::all();
+        let mut fact_claim = Claim::rule("Fact proven by repo", "src/core.rs");
+        fact_claim.kind = NodeKind::Fact;
+        fact_claim.origin = Origin::Repo;
+        let fact = learn(&mut m, &fact_claim, 100.0)[0].node;
+
+        let repl = learn(&mut m, &Claim::rule("User tries to replace fact", "src/core.rs"), 101.0)[0].node;
+        m.upsert_edge(repl, fact, EdgeKind::Supersedes, 1.0, 1.0);
+
+        let mut session = SessionState::new("anchored-test");
+        let out = read_context(&mut m, &view, &mut session, "src/core.rs");
+        assert!(out.contains("Fact proven by repo"), "anchored fact must continue to be injected");
+    }
+
+    #[test]
+    fn test_render_node_terminates_on_cycle_of_3() {
+        let mut m = Memory::default();
+        let n1 = learn(&mut m, &Claim::rule("Primera regla de prueba ciclo", "src"), 100.0)[0].node;
+        let n2 = learn(&mut m, &Claim::rule("Segunda regla de prueba ciclo", "src"), 101.0)[0].node;
+        let n3 = learn(&mut m, &Claim::rule("Tercera regla de prueba ciclo", "src"), 102.0)[0].node;
+        // Decision with cause n1
+        let mut d = Claim::rule("Decision relying on n1 ciclo", "src");
+        d.kind = NodeKind::Decision;
+        let dec = learn(&mut m, &d, 103.0)[0].node;
+        m.upsert_edge(n1, dec, EdgeKind::Causes, 1.0, 1.0);
+
+        // Create cycle of 3 manually: n1 -> n2 -> n3 -> n1
+        m.upsert_edge(n2, n1, EdgeKind::Supersedes, 1.0, 1.0);
+        m.upsert_edge(n3, n2, EdgeKind::Supersedes, 1.0, 1.0);
+        m.upsert_edge(n1, n3, EdgeKind::Supersedes, 1.0, 1.0);
+
+        let scores = score::score_all(&m, &View::all());
+        // Must terminate safely without infinite loop
+        let line = render_node(&m, &scores, &m.nodes[dec as usize]);
+        assert!(line.contains("Decision relying on n1"));
+    }
+}

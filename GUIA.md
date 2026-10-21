@@ -213,7 +213,8 @@ Cuando se dispone del índice de código derivado (`.cthg/indice.tsv`), el canal
 3. **Desempate directo vs. vecino**: si una regla llega a la vez por vía directa y como vecina, la vía directa prevalece estrictamente (afinidad directa íntegra, sin atenuación y sin prefijo `vecino de`).
 4. **Atribución explícita**: la regla inyectada comunica al agente el motivo del enrutamiento:
    `- #3 regla (src/cli.rs, vecino de src/main.rs): ...`
-5. **Invariante de propuestas**: un recuerdo en estado de propuesta (`PROPOSED`) solo se desbloquea leyendo su propio archivo directo (`may_inject(n, Some(read_path))`), nunca a través de vecindad.
+5. **Invariante de propuestas**: un recuerdo en estado de propuesta (`PROPOSED`) solo se desbloquea leyendo su propio archivo directo (`may_inject(n, score, Some(read_path))`), nunca a través de vecindad.
+6. **Invariante de nodos sustituidos**: un recuerdo que tiene algún sustituto visible con $\chi > 0$ (`score.superseded`, comprobado en $O(1)$) **no se inyecta por ningún canal** (núcleo, mensaje, lectura ni vecinos), pues su sustituto ya lleva la versión vigente. Sigue existiendo en el histórico de `cthg list --all` marcado como `[sustituido]` y con $\chi$ mitigado ($E = -1$), y solo volvería a ser inyectable si el sustituto fuera negado (hasta $\chi \le 0$). La banda «descartado — no repetir» queda reservada para intentos fallidos o negados, no para lo sustituido.
 
 **Fusión**:
 
@@ -648,8 +649,9 @@ En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`), `<r
 | `cthg init` | ✅ | crea `.cthg/memoria.cthg` en la raíz git; detecta el tronco |
 | `cthg learn <texto> [--kind K] [--path P] [--symbol S] [--cause T] [--cause-id N] [--contradicts N] [--supersedes N] [--origin O] [--core] [--plan] [--deny]` | ✅ | sección 6 |
 | `cthg confirm N` / `cthg deny N` | ✅ | α + 1 / β + 1 (lo anclado no se mueve); `confirm` es lo único que convierte una corrección capturada (`[propuesta]`) en regla inyectable |
+| `cthg supersede <nuevo> <viejo>` | ✅ | añade la arista `nuevo` → `viejo` de tipo `Supersedes`; se niega si algún id no existe, si son el mismo, si el viejo está `ANCHORED`, si el nuevo es propuesta (`PROPOSED`) o plan (`POTENTIAL`), o si ya existe la arista inversa (ciclo directo). Registra una decisión de ahora, aunque `nuevo < viejo`: no contradice «Y solo avanza» porque ningún nodo se mueve ni se borra |
 | `cthg core [<id>… [--unset]] [--budget N]` | ✅ | canal 0 tal como se inyecta (global y proyecto); con ids, marca o desmarca `CORE`. Avisa si el núcleo no cabe en el presupuesto |
-| `cthg <init\|learn\|confirm\|deny\|core\|list\|import> --global` | ✅ | lo mismo sobre la memoria global (sección 8.1) |
+| `cthg <init\|learn\|confirm\|deny\|supersede\|core\|list\|import> --global` | ✅ | lo mismo sobre la memoria global (sección 8.1) |
 | `cthg recall [--prompt T] [--path P]… [--git] [--budget N] [--limit N] [--sin-vecinos]` | ✅ | canales 1–3 (rutas, símbolos de `git diff`, renombres `-M`, vecinos del grafo de código e identificadores) |
 | `cthg index [--rebuild]` | ✅ | actualiza o reconstruye `.cthg/indice.tsv` (formato v2); omite ruido y bundles |
 | `cthg map [ruta] [--limit N] [--tests]` | ✅ | mapa estructurado de un archivo (reglas y vecinos arriba, dependencias y símbolos abajo con firmas truncadas); distingue archivo indexado, no indexado (con sus reglas) y archivo nuevo (reglas de carpetas y hasta 5 hermanos con su API pública) |

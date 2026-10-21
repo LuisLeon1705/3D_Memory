@@ -44,6 +44,7 @@ const HELP: &str = "cthg — memoria de proyecto (ruta · tiempo · confianza)
              [--contradicts N] [--supersedes N] [--origin usuario|agente|repo|importado]
              [--core] [--plan] [--deny]
   cthg confirm <id>      cthg deny <id>
+  cthg supersede <nuevo> <viejo>
   cthg core [<id>... [--unset]] [--budget N]
   cthg recall [--prompt <texto>] [--path P]... [--git] [--budget N] [--limit N] [--sin-vecinos]
   cthg index [--rebuild]
@@ -57,7 +58,7 @@ const HELP: &str = "cthg — memoria de proyecto (ruta · tiempo · confianza)
   cthg hook antigravity                              (Google Antigravity, PreInvocation)
   cthg hook antigravity-stop                         (Google Antigravity, Stop)
   cthg verify [--run-commands]
-  cthg <init|learn|confirm|deny|core|list|import> --global   (memoria de todos los proyectos)
+  cthg <init|learn|confirm|deny|supersede|core|list|import> --global   (memoria de todos los proyectos)
   cthg eval <carpeta> [--markdown] [--repo DIR] [--file CLAUDE.md] [--core-auto] [--w-vecino X] [--w-simbolo Y]
   cthg corrections [<transcript.jsonl|carpeta>...] [--desde AAAA-MM-DD] [--detalle]
       (correcciones del usuario por conversación; sin rutas, los transcripts de Antigravity)
@@ -433,6 +434,26 @@ fn run(raw: &[String]) -> Result<(), String> {
                 println!("   era una corrección capturada: desde ahora se inyecta como las demás");
             }
         }
+        "supersede" => {
+            let (mut m, _lock) = repo.load_locked()?;
+            let (Some(new_str), Some(old_str)) = (a.pos.first(), a.pos.get(1)) else {
+                return Err("uso: cthg supersede <nuevo> <viejo>".into());
+            };
+            let new_id = parse_id(&m, Some(new_str))?;
+            let old_id = parse_id(&m, Some(old_str))?;
+            let v = view(&repo, &m);
+            if !v.sees(&m.nodes[new_id as usize]) {
+                return Err(format!("#{new_id} no es visible en esta vista"));
+            }
+            if !v.sees(&m.nodes[old_id as usize]) {
+                return Err(format!("#{old_id} no es visible en esta vista"));
+            }
+            let before = score::score_all(&m, &v)[old_id as usize].chi;
+            learn::supersede(&mut m, new_id, old_id)?;
+            repo.save(&m)?;
+            let after = score::score_all(&m, &v)[old_id as usize].chi;
+            println!("#{old_id} χ {before:+.2} → {after:+.2} sustituido por #{new_id}");
+        }
         "core" => {
             let budget_arg: Option<usize> = a.num("budget")?;
             if !a.pos.is_empty() {
@@ -522,7 +543,7 @@ fn run(raw: &[String]) -> Result<(), String> {
             let ids: Vec<u32> = retrieve::recall(&m, &scores, &q, limit, -1.0)
                 .iter()
                 .map(|r| r.id)
-                .filter(|&id| hook::may_inject(&m.nodes[id as usize], None))
+                .filter(|&id| hook::may_inject(&m.nodes[id as usize], &scores[id as usize], None))
                 .collect();
             let neighbor_origins = spatial::node_neighbor_origins(&m, &q.targets, &ids);
             let ids = retrieve::fit_budget(&m, &ids, budget, |n| {
@@ -553,6 +574,9 @@ fn run(raw: &[String]) -> Result<(), String> {
                     if n.has(f) {
                         tags.push(t);
                     }
+                }
+                if s.superseded {
+                    tags.push("sustituido");
                 }
                 let branch = if n.branch.is_empty() { String::new() } else { format!(" @{}", n.branch) };
                 println!(
@@ -1016,7 +1040,7 @@ fn core_budget(repo: &Repo, m: &Memory) -> usize {
 fn project_core(m: &Memory, scores: &[score::Score], global_toks: &[Vec<String>]) -> Vec<u32> {
     retrieve::core(m, scores)
         .into_iter()
-        .filter(|&id| hook::may_inject(&m.nodes[id as usize], None))
+        .filter(|&id| hook::may_inject(&m.nodes[id as usize], &scores[id as usize], None))
         .filter(|&id| {
             let toks = text::tokens(&m.nodes[id as usize].text);
             !global_toks.iter().any(|g| text::similarity(&toks, g) >= hook::DUPLICATE_OF_GLOBAL)

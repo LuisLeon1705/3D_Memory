@@ -24,6 +24,8 @@ pub struct Score {
     pub chance: f32,
     /// false when the node lies outside the view (future, plan, other branch).
     pub visible: bool,
+    /// true if superseded by a visible node with chi > 0.
+    pub superseded: bool,
 }
 
 /// What is visible: everything written up to `now` on trunk or on one of `branches`.
@@ -95,7 +97,7 @@ pub fn score_all(m: &Memory, view: &View) -> Vec<Score> {
         let node = &m.nodes[i];
         let a = chance(node);
         if !visible[i] {
-            out[i] = Score { chi: -1.0, engineer: -1.0, chance: a, visible: false };
+            out[i] = Score { chi: -1.0, engineer: -1.0, chance: a, visible: false, superseded: false };
             continue;
         }
         let e = if node.anchored() {
@@ -117,14 +119,16 @@ pub fn score_all(m: &Memory, view: &View) -> Vec<Score> {
             }
         };
         let chi = if node.anchored() { blend(1.0, a, node.evidence()).max(0.9) } else { blend(e, a, node.evidence()) };
-        out[i] = Score { chi, engineer: e, chance: a, visible: true };
+        out[i] = Score { chi, engineer: e, chance: a, visible: true, superseded: false };
     }
-    // Replacements are always newer than what they replace, so they are settled by now.
+    // Replacements can point in either direction (e.g. cthg supersede new old with new < old).
+    // An anchored fact is never superseded (only verify moves it).
     for i in 0..n {
         if !out[i].visible || m.nodes[i].anchored() {
             continue;
         }
-        if superseded_by[i].iter().any(|&s| out[s as usize].visible && out[s as usize].chi > 0.0) {
+        if has_active_substitute(m, &out, i) {
+            out[i].superseded = true;
             out[i].engineer = -1.0;
             out[i].chi = blend(-1.0, out[i].chance, m.nodes[i].evidence());
         }
@@ -140,6 +144,38 @@ pub fn score_all(m: &Memory, view: &View) -> Vec<Score> {
         }
     }
     out
+}
+
+fn has_active_substitute(m: &Memory, out: &[Score], i: usize) -> bool {
+    let mut visited = std::collections::HashSet::new();
+    let mut queue = std::collections::VecDeque::new();
+    for e in &m.edges {
+        if e.to == i as u32 && e.kind == EdgeKind::Supersedes {
+            queue.push_back(e.from as usize);
+            visited.insert(e.from as usize);
+        }
+    }
+    while let Some(s) = queue.pop_front() {
+        if !out[s].visible {
+            continue;
+        }
+        let s_superseded = m.edges.iter().any(|e| e.to == s as u32 && e.kind == EdgeKind::Supersedes);
+        if !s_superseded {
+            if out[s].chi > 0.0 {
+                return true;
+            }
+        } else {
+            if out[s].chi > 0.0 {
+                return true;
+            }
+            for e in &m.edges {
+                if e.to == s as u32 && e.kind == EdgeKind::Supersedes && visited.insert(e.from as usize) {
+                    queue.push_back(e.from as usize);
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Band name for the injected context and the UI.
@@ -235,5 +271,49 @@ mod tests {
         let trunk = score_all(&m, &View::on_branch(f64::INFINITY, ""));
         assert!(!trunk[new as usize].visible, "branch memory is not on trunk until merged");
         assert!(trunk[old as usize].chi > 0.25, "the old rule still holds on trunk");
+    }
+
+    #[test]
+    fn superseded_chain_invariant_to_id_order() {
+        // Case A: substitute has smaller ID (0 supersedes 1, 1 supersedes 2)
+        let mut m_a = Memory::default();
+        let a0 = node(&mut m_a, Origin::User, 100.0);
+        let a1 = node(&mut m_a, Origin::User, 101.0);
+        let a2 = node(&mut m_a, Origin::User, 102.0);
+        m_a.upsert_edge(a0, a1, EdgeKind::Supersedes, 1.0, 1.0);
+        m_a.upsert_edge(a1, a2, EdgeKind::Supersedes, 1.0, 1.0);
+        let s_a = score_all(&m_a, &View::all());
+        assert!(!s_a[a0 as usize].superseded);
+        assert!(s_a[a1 as usize].superseded);
+        assert!(s_a[a2 as usize].superseded);
+        assert!(s_a[a0 as usize].chi > 0.0);
+        assert!(s_a[a1 as usize].chi < 0.0);
+        assert!(s_a[a2 as usize].chi < 0.0);
+
+        // Case B: substitute has larger ID (2 supersedes 1, 1 supersedes 0)
+        let mut m_b = Memory::default();
+        let b0 = node(&mut m_b, Origin::User, 100.0);
+        let b1 = node(&mut m_b, Origin::User, 101.0);
+        let b2 = node(&mut m_b, Origin::User, 102.0);
+        m_b.upsert_edge(b2, b1, EdgeKind::Supersedes, 1.0, 1.0);
+        m_b.upsert_edge(b1, b0, EdgeKind::Supersedes, 1.0, 1.0);
+        let s_b = score_all(&m_b, &View::all());
+        assert!(!s_b[b2 as usize].superseded);
+        assert!(s_b[b1 as usize].superseded);
+        assert!(s_b[b0 as usize].superseded);
+        assert!(s_b[b2 as usize].chi > 0.0);
+        assert!(s_b[b1 as usize].chi < 0.0);
+        assert!(s_b[b0 as usize].chi < 0.0);
+    }
+
+    #[test]
+    fn anchored_node_never_superseded_by_edge() {
+        let mut m = Memory::default();
+        let fact = node(&mut m, Origin::Repo, 100.0);
+        let replacement = node(&mut m, Origin::User, 101.0);
+        m.upsert_edge(replacement, fact, EdgeKind::Supersedes, 1.0, 1.0);
+        let s = score_all(&m, &View::all());
+        assert!(!s[fact as usize].superseded, "anchored fact must never be marked superseded");
+        assert!(s[fact as usize].chi >= 0.9, "anchored fact chi stays >= 0.9");
     }
 }

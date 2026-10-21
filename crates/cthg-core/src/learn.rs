@@ -279,9 +279,9 @@ pub fn learn(m: &mut Memory, c: &Claim, now: f64) -> Vec<LearnEvent> {
         }
     }
     if let Some(old) = c.supersedes.filter(|&o| before.get(o as usize).is_some_and(|s| s.visible)) {
-        // Anchored facts are only replaced when `verify` drops their anchor.
-        m.upsert_edge(fid, old, EdgeKind::Supersedes, 1.0, 1.0);
-        touched.push((old, "sustituido"));
+        if supersede(m, fid, old).is_ok() {
+            touched.push((old, "sustituido"));
+        }
     }
     if let Some(cause) = c.cause.as_deref().filter(|s| text::tokens(s).len() >= 2) {
         let ctoks = text::tokens(cause);
@@ -336,6 +336,56 @@ pub fn feedback(m: &mut Memory, id: u32, vote: i32) -> bool {
     n.activation = 1.0;
     consolidate(m, id);
     true
+}
+
+/// Adds a `Supersedes` edge `new` -> `old`.
+///
+/// Fails if:
+/// - either id does not exist, or both are the same;
+/// - the old node is ANCHORED (only verify moves it, invariant);
+/// - the new node is PROPOSED or not visible (e.g. POTENTIAL plan);
+/// - a direct cycle already exists (old -> new with Supersedes).
+pub fn supersede(m: &mut Memory, new: u32, old: u32) -> Result<usize, String> {
+    if new == old {
+        return Err(format!("#{new} y #{old} son el mismo nodo: un nodo no puede sustituirse a sí mismo"));
+    }
+    if m.node(new).is_none() {
+        return Err(format!("no existe el nodo #{new}"));
+    }
+    if m.node(old).is_none() {
+        return Err(format!("no existe el nodo #{old}"));
+    }
+    if m.nodes[old as usize].anchored() {
+        return Err(format!("#{old} está anclado al repo: solo `verify` lo mueve"));
+    }
+    if m.nodes[new as usize].has(flags::PROPOSED) {
+        return Err(format!("#{new} es una propuesta: no puede sustituir a otro nodo"));
+    }
+    if m.nodes[new as usize].has(flags::POTENTIAL) {
+        return Err(format!("#{new} es un plan: no es visible"));
+    }
+    if m.nodes[old as usize].has(flags::POTENTIAL) {
+        return Err(format!("#{old} es un plan: no es visible"));
+    }
+    // Reject any cycle: if new is reachable from old following Supersedes edges
+    let mut visited = std::collections::HashSet::new();
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(old);
+    visited.insert(old);
+    while let Some(curr) = queue.pop_front() {
+        for e in &m.edges {
+            if e.from == curr && e.kind == EdgeKind::Supersedes {
+                if e.to == new {
+                    return Err(format!("ya existe una cadena de sustitución de #{old} a #{new}: crearía un ciclo"));
+                }
+                if visited.insert(e.to) {
+                    queue.push_back(e.to);
+                }
+            }
+        }
+    }
+    let idx = m.upsert_edge(new, old, EdgeKind::Supersedes, 1.0, 1.0);
+    Ok(idx)
 }
 
 /// Start of an agent session: forgetting runs once per session, not per message.
@@ -425,5 +475,54 @@ mod tests {
         new.supersedes = Some(old);
         learn(&mut m, &new, 200.0);
         assert!(chi(&m, old) < 0.0, "chi = {}", chi(&m, old));
+    }
+    #[test]
+    fn supersede_rejects_invalid_cases() {
+        let mut m = Memory::default();
+        let r1 = learn(&mut m, &Claim::rule("Alpha primero manzana", "src"), 100.0)[0].node;
+        let r2 = learn(&mut m, &Claim::rule("Beta segundo platano", "src"), 101.0)[0].node;
+
+        // 1. Same id
+        let err = supersede(&mut m, r1, r1).unwrap_err();
+        assert!(err.contains("mismo nodo"));
+
+        // 2. Non-existent id
+        let err = supersede(&mut m, 999, r1).unwrap_err();
+        assert!(err.contains("no existe"));
+        let err = supersede(&mut m, r1, 999).unwrap_err();
+        assert!(err.contains("no existe"));
+
+        // 3. Old is ANCHORED
+        let mut fact = Claim::rule("Hecho probado", "Cargo.toml");
+        fact.kind = NodeKind::Fact;
+        fact.origin = Origin::Repo;
+        let f_anchored = learn(&mut m, &fact, 102.0)[0].node;
+        let err = supersede(&mut m, r1, f_anchored).unwrap_err();
+        assert!(err.contains("anclado"));
+
+        // 4. New is PROPOSED
+        let mut prop = Claim::rule("Propuesta pendiente", "src");
+        prop.proposed = true;
+        let p_proposed = learn(&mut m, &prop, 103.0)[0].node;
+        let err = supersede(&mut m, p_proposed, r1).unwrap_err();
+        assert!(err.contains("propuesta"));
+
+        // 5. New is POTENTIAL (plan)
+        let mut plan = Claim::rule("Plan futuro", "src");
+        plan.kind = NodeKind::Plan;
+        let p_plan = learn(&mut m, &plan, 104.0)[0].node;
+        let err = supersede(&mut m, p_plan, r1).unwrap_err();
+        assert!(err.contains("plan"));
+
+        // 6. Direct cycle: supersede r1 -> r2 succeeds, then r2 -> r1 fails
+        supersede(&mut m, r1, r2).expect("valid supersede");
+        let err = supersede(&mut m, r2, r1).unwrap_err();
+        assert!(err.contains("ciclo"));
+
+        // 7. Cycle of 3: r1 -> r2, r2 -> r3, then r3 -> r1 fails
+        let r3 = learn(&mut m, &Claim::rule("Gamma tercero cereza", "src"), 105.0)[0].node;
+        supersede(&mut m, r2, r3).expect("valid supersede 2 -> 3");
+        let err = supersede(&mut m, r3, r1).unwrap_err();
+        assert!(err.contains("ciclo"));
     }
 }
