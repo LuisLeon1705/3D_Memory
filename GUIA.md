@@ -378,7 +378,7 @@ El canal espacial original solo conocía el árbol de carpetas (en `spatial.rs`:
 - **8a (completada)**: Escáner de Rust, `.cthg/indice.tsv`, comandos CLI `cthg index`, `cthg map`, `cthg where` y `cthg callers`.
 - **8b (completada)**: Enrutado por vecinos e identificadores de código con eval (el canal espacial propaga afinidad hacia importaciones directas a 1 salto e identificadores del prompt; actualización del índice en `session-start` y primer turno de Antigravity con timeout de 500 ms).
 - **8c (completada)**: Escáneres políglotas (Python, JS/TS, HTML), firmas en todos los lenguajes, decoradores de Python, formato v2 y filtros de bundle/ruido.
-- **8d**: Canal pedido: skill y hooks orientan al modelo hacia `cthg map`.
+- **8d (completada)**: Canal pedido: `cthg map` reordenado (reglas arriba, en vecinos, importaciones y símbolos abajo; soporte para archivos no indexados y archivos nuevos con sus reglas de carpeta y hermanos), skill `project-memory` («Antes de escribir código»), sugerencia de mapa en CORE al iniciar sesión si hay índice y hooks silenciosos ante pánicos.
 - **8e**: Visor 3D (`memviz`): visualización interactiva del grafo de código y la memoria causal.
 - **8f**: Base de datos y rutas HTTP: tablas y consultas por función, modelos ORM, decoradores de ruta; diseñarla tras verla en un proyecto real.
 
@@ -652,7 +652,7 @@ En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`), `<r
 | `cthg <init\|learn\|confirm\|deny\|core\|list\|import> --global` | ✅ | lo mismo sobre la memoria global (sección 8.1) |
 | `cthg recall [--prompt T] [--path P]… [--git] [--budget N] [--limit N] [--sin-vecinos]` | ✅ | canales 1–3 (rutas, símbolos de `git diff`, renombres `-M`, vecinos del grafo de código e identificadores) |
 | `cthg index [--rebuild]` | ✅ | actualiza o reconstruye `.cthg/indice.tsv` (formato v2); omite ruido y bundles |
-| `cthg map [ruta] [--limit N] [--tests]` | ✅ | mapa de símbolos de un archivo con firmas (truncadas a ~100 caracteres) y reglas asociadas y en vecinos; resume variables de módulo de Python si superan 10 |
+| `cthg map [ruta] [--limit N] [--tests]` | ✅ | mapa estructurado de un archivo (reglas y vecinos arriba, dependencias y símbolos abajo con firmas truncadas); distingue archivo indexado, no indexado (con sus reglas) y archivo nuevo (reglas de carpetas y hasta 5 hermanos con su API pública) |
 | `cthg where <símbolo>` | ✅ | busca declaraciones de un símbolo mostrando su ruta, línea, tipo y firma completa `{ruta}:{linea} {tipo} {nombre}{firma}` |
 | `cthg callers <símbolo> [--tests]` | ✅ | busca quién llama a un símbolo en el grafo de código, respetando aislamiento entre familias de lenguajes (`Web`, `Python`, `Rust`) |
 | `cthg list [--all]` | ✅ | todos los nodos con χ, flags (incluido `obsoleto`) y rama |
@@ -676,7 +676,7 @@ En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`), `<r
 | `PostToolUse` (`Edit\|MultiEdit\|Write`) | `cthg hook edit` | 2 (`hookSpecificOutput.additionalContext`): reglas de ese archivo y sus carpetas (si no se inyectaron antes), y sube la activación |
 | `Stop` | `cthg hook stop` | aprende las correcciones del usuario del transcript (sección 6.1); no escribe nada y nunca impide terminar |
 
-Plantilla y reglas en [hooks/](hooks/README.md). En resumen: nunca bloquear (si falla, código 0 y sin salida), no repetir dentro de una sesión y respetar los presupuestos dinámicos (sección 4.4). Si la memoria está bloqueada por otro proceso más de 1,5 s, el hook responde igual pero no guarda. Si el núcleo no cabe en su presupuesto, `session-start` lo dice en el propio contexto, en vez de recortarlo en silencio. Se instalan en el `.claude/settings.json` **del proyecto**, no en el global. Llaman a `cthg` por su nombre: se instala en el PATH con `cargo install --path crates/cthg-cli --locked` (repetir tras cada cambio). Para ver la memoria, la app Memoria 3D (`memviz`, en `Memory-Handler/3D-Memory-Visualizer`) abre cualquier repo con memoria.
+Plantilla y reglas en [hooks/](hooks/README.md). En resumen: nunca bloquear (si falla, código 0 y sin salida), no repetir dentro de una sesión y respetar los presupuestos dinámicos (sección 4.4). Si la memoria está bloqueada por otro proceso más de 1,5 s, el hook responde igual pero no guarda. Si el núcleo no cabe en su presupuesto, `session-start` lo dice en el propio contexto, en vez de recortarlo en silencio. Al iniciar sesión, si el proyecto tiene índice de código, el bloque `CORE` incluye un recordatorio para pedir mapas con `cthg map` y buscar símbolos con `where`/`callers` en vez de usar grep; además, los hooks apagan stderr en caso de pánico para no romper los protocolos JSON. Se instalan en el `.claude/settings.json` **del proyecto**, no en el global. Llaman a `cthg` por su nombre: se instala en el PATH con `cargo install --path crates/cthg-cli --locked` (repetir tras cada cambio). Para ver la memoria, la app Memoria 3D (`memviz`, en `Memory-Handler/3D-Memory-Visualizer`) abre cualquier repo con memoria.
 
 Los `CLAUDE.md` anidados por carpeta que Claude Code ya carga son la **línea base** contra la que medir.
 
@@ -936,7 +936,7 @@ Criterio de éxito: ≥ 70 % menos tokens que `completo`, **cero** críticas per
 | 8a | Grafo del código: escáner Rust, `.cthg/indice.tsv`, `index`, `map`, `where`, `callers` | ✅ (77 tests) |
 | 8b | Enrutado por vecinos e identificadores de código con eval (canal espacial extendido a importadores y dependencias a 1 salto, atribución de vecino, desempate directo) | ✅ (89 tests) |
 | 8c | Escáneres para más lenguajes (Python, JS/TS con JSX/TSX, HTML), firmas en todos los lenguajes, decoradores de Python, índice v2, aislamiento por familias y robustez ante pánicos | ✅ (109 tests) |
-| 8d | Canal pedido: skill y hooks apuntan a `cthg map` para auto-orientación | pendiente |
+| 8d | Canal pedido: `cthg map` reordenado (reglas arriba, archivos nuevos y no indexados), skill actualizada, línea en CORE de sesión y hooks silenciosos | ✅ (117 tests) |
 | 8e | Visor 3D (`memviz`): proyección del grafo de código junto al hipergrafo de memoria | pendiente |
 | 8f | Base de datos y rutas HTTP: tablas y consultas por función, modelos ORM, decoradores de ruta; diseñarla tras verla en un proyecto real | pendiente |
 | 7 | Ramas fusionadas visibles en el tronco, `gc`, visor 3D | pendiente (la fase 8 va antes que la 7) |

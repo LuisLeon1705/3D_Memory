@@ -270,7 +270,47 @@ impl Scope {
     }
 }
 
-/// Scans stripped Rust tokens and extracts symbols, imports, and calls.
+fn advance_sig_tokens(tokens: &[Token], start: usize) -> (usize, Option<usize>) {
+    let n = tokens.len();
+    let mut j = start;
+    let mut paren: i32 = 0;
+    let mut bracket: i32 = 0;
+    let mut brace: i32 = 0;
+    let mut angle: i32 = 0;
+    let mut eq_pos: Option<usize> = None;
+
+    while j < n {
+        let t = tokens[j].text.as_str();
+        if paren == 0 && bracket == 0 && brace == 0 && angle == 0 {
+            if t == "{" || t == ";" {
+                break;
+            }
+            if t == "=" && eq_pos.is_none() {
+                eq_pos = Some(j);
+            }
+        }
+        match t {
+            "(" => paren += 1,
+            ")" => if paren > 0 { paren -= 1; },
+            "[" => bracket += 1,
+            "]" => if bracket > 0 { bracket -= 1; },
+            "{" => brace += 1,
+            "}" => if brace > 0 { brace -= 1; },
+            "<" => angle += 1,
+            ">" => {
+                if j > start && tokens[j - 1].text == "-" {
+                    // Part of `->` arrow, not a closing generic angle
+                } else if angle > 0 {
+                    angle -= 1;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    (j, eq_pos)
+}
+
 pub fn scan_rust(content: &str) -> FileScan {
     let clean = strip_comments_and_strings(content.as_bytes());
     let tokens = tokenize(&clean);
@@ -440,18 +480,26 @@ pub fn scan_rust(content: &str) -> FileScan {
             let is_test = pending_test_attr || stack.iter().any(|(s, _)| s.is_test());
             pending_test_attr = false;
 
-            if i + 1 < n && is_ident(&tokens[i + 1].text) {
-                let name = tokens[i + 1].text.clone();
+            let (name_idx, sig_start_idx) = if kind == "static" && i + 1 < n && tokens[i + 1].text == "mut" {
+                (i + 2, i + 3)
+            } else {
+                (i + 1, i + 2)
+            };
+
+            if name_idx < n && is_ident(&tokens[name_idx].text) {
+                let name = tokens[name_idx].text.clone();
                 let sym_idx = scan.symbols.len();
                 let parent = current_parent(&stack);
 
-                // Advance to either `{` or `;` to capture signature
-                let mut j = i + 2;
-                while j < n && tokens[j].text != "{" && tokens[j].text != ";" {
-                    j += 1;
-                }
-                let sig_raw = if j <= n && i + 2 < j {
-                    &content[tokens[i + 2].offset..tokens[j].offset]
+                let (j, eq_pos) = advance_sig_tokens(&tokens, sig_start_idx);
+                let cut_end = if matches!(kind.as_str(), "const" | "static" | "type") {
+                    eq_pos.unwrap_or(j)
+                } else {
+                    j
+                };
+                let end_offset = if cut_end < n { tokens[cut_end].offset } else { content.len() };
+                let sig_raw = if cut_end <= n && sig_start_idx < cut_end {
+                    &content[tokens[sig_start_idx].offset..end_offset]
                 } else {
                     ""
                 };
@@ -496,13 +544,10 @@ pub fn scan_rust(content: &str) -> FileScan {
             pending_test_attr = false;
             let parent = current_parent(&stack);
 
-            // Advance to `{` or `;` (trait methods can end in ;) to capture signature
-            let mut j = i + 2;
-            while j < n && tokens[j].text != "{" && tokens[j].text != ";" {
-                j += 1;
-            }
+            let (j, _) = advance_sig_tokens(&tokens, i + 2);
+            let end_offset = if j < n { tokens[j].offset } else { content.len() };
             let sig_raw = if j <= n && i + 2 < j {
-                &content[tokens[i + 2].offset..tokens[j].offset]
+                &content[tokens[i + 2].offset..end_offset]
             } else {
                 ""
             };
@@ -1186,5 +1231,46 @@ impl Calculator {
                 "crate::spatial::Target".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn const_static_type_signatures_strip_assignment_and_value() {
+        let src = r#"
+pub const BUFFER_SIZE: usize = 1024;
+pub const DIR: &str = ".cthg";
+pub const MAGIC: &[u8; 4] = b"CTHG";
+pub static mut TABLE: [i32; N] = [0; N];
+pub const MAP: HashMap<String, Vec<u8>> = HashMap::new();
+pub type Result<T> = std::result::Result<T, String>;
+pub type Cache = HashMap<String, Vec<u8>>;
+pub fn process(buf: &[u8; 4]) -> [i32; 8] {
+    let x = 1;
+}
+"#;
+        let scan = scan_rust(src);
+        assert_eq!(scan.symbols.len(), 8);
+        assert_eq!(scan.symbols[0].name, "BUFFER_SIZE");
+        assert_eq!(scan.symbols[0].signature, ": usize");
+
+        assert_eq!(scan.symbols[1].name, "DIR");
+        assert_eq!(scan.symbols[1].signature, ": &str");
+
+        assert_eq!(scan.symbols[2].name, "MAGIC");
+        assert_eq!(scan.symbols[2].signature, ": &[u8; 4]");
+
+        assert_eq!(scan.symbols[3].name, "TABLE");
+        assert_eq!(scan.symbols[3].signature, ": [i32; N]");
+
+        assert_eq!(scan.symbols[4].name, "MAP");
+        assert_eq!(scan.symbols[4].signature, ": HashMap<String, Vec<u8>>");
+
+        assert_eq!(scan.symbols[5].name, "Result");
+        assert_eq!(scan.symbols[5].signature, "<T>");
+
+        assert_eq!(scan.symbols[6].name, "Cache");
+        assert_eq!(scan.symbols[6].signature, "");
+
+        assert_eq!(scan.symbols[7].name, "process");
+        assert_eq!(scan.symbols[7].signature, "(buf: &[u8; 4]) -> [i32; 8]");
     }
 }

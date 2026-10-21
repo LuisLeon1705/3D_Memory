@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+const MAP_HINT: &str = "Mapa del proyecto: antes de escribir un archivo, `cthg map <ruta>` trae sus reglas y vecinos; `cthg where/callers <símbolo>` en vez de grep.";
 const DIR: &str = ".cthg";
 const FILE: &str = "memoria.cthg";
 const SES_DIR: &str = "sesion";
@@ -67,7 +68,10 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("hook") {
         // Hooks never block or fail out loud: on any error, exit 0 with no output.
-        let _ = run_hook(&args[1..]);
+        std::panic::set_hook(Box::new(|_| {}));
+        let _ = std::panic::catch_unwind(|| {
+            let _ = run_hook(&args[1..]);
+        });
         return;
     }
     if let Err(e) = run(&args) {
@@ -834,7 +838,7 @@ escrito: {}", path.display());
                     let parent_str = r.parent.as_ref().map(|p| format!(" [{p}]")).unwrap_or_default();
                     let sig_str = if r.signature.is_empty() {
                         String::new()
-                    } else if r.signature.starts_with('(') || r.signature.starts_with('<') {
+                    } else if r.signature.starts_with('(') || r.signature.starts_with('<') || r.signature.starts_with(':') {
                         r.signature.clone()
                     } else {
                         format!(" {}", r.signature)
@@ -890,10 +894,25 @@ escrito: {}", path.display());
             let raw_target = a.pos.first().map(|s| spatial::normalize(s));
             let target = raw_target.as_deref().unwrap_or("");
 
-            if let Some(entry) = idx.get_file(target) {
-                print_file_map(&repo, &idx, entry, a.flag("tests"))?;
-            } else if cthg_core::lang::lang_of(target).is_some() && repo.root.join(target).is_file() {
-                return Err(format!("el archivo '{target}' no está en el índice"));
+            let is_indexed = idx.get_file(target).is_some();
+            let exists_on_disk = !target.is_empty() && repo.root.join(target).exists();
+            let is_dir_on_disk = !target.is_empty() && repo.root.join(target).is_dir();
+            let is_tree_query = target.is_empty()
+                || is_dir_on_disk
+                || (!is_indexed && !exists_on_disk && idx.files.iter().any(|f| f.path.starts_with(&format!("{target}/"))));
+
+            if !is_tree_query {
+                let m_opt = if repo.file.exists() { repo.load().ok() } else { None };
+                let view_m;
+                let scores = if let Some(ref m) = m_opt {
+                    view_m = view(&repo, m);
+                    score::score_all(m, &view_m)
+                } else {
+                    Vec::new()
+                };
+
+                let res = index::file_map(&idx, m_opt.as_ref(), &scores, target, exists_on_disk);
+                print_file_map_result(&res, a.flag("tests"), m_opt.as_ref(), Some(&scores));
             } else {
                 let limit = a.num("limit")?.unwrap_or(50);
                 let tree = index::compact_tree(&idx, target, limit);
@@ -1061,7 +1080,18 @@ fn run_antigravity(raw: &str) -> Result<String, String> {
     // `EPHEMERAL_MESSAGE` steps and the model still sees them next turn): the CORE goes once,
     // and nothing already injected in this conversation is injected again.
     if session.turn == -1 {
-        parts.push(hook::core_context(&mut m, &v, &mut session, global.as_ref()));
+        let mut core = hook::core_context(&mut m, &v, &mut session, global.as_ref());
+        let has_code_index = idx.as_ref().is_some_and(|i| !i.files.is_empty());
+        if has_code_index {
+            if !core.is_empty() {
+                core.push('\n');
+                core.push_str(MAP_HINT);
+            } else {
+                core = MAP_HINT.to_string();
+            }
+            session.spent += text::approx_tokens(MAP_HINT) as u64;
+        }
+        parts.push(core);
         session.turn = CORE_GIVEN;
     }
     let last_msg = steps.iter().rposition(|s| matches!(s, Step::User { index, .. } | Step::Agent { index, .. } if *index > session.turn));
@@ -1141,12 +1171,22 @@ fn run_hook(rest: &[String]) -> Result<(), String> {
 
     match event {
         "session-start" => {
-            let _ = update_index_with_timeout(&repo.root, Duration::from_millis(500));
+            let idx = update_index_with_timeout(&repo.root, Duration::from_millis(500));
             let mut session = hook::SessionState::new(&input.session_id);
             session.native = native();
             let v = view(&repo, &m);
             let global = load_global();
-            let out = hook::handle_session_start_layered(&mut m, &v, &mut session, global.as_ref());
+            let mut out = hook::handle_session_start_layered(&mut m, &v, &mut session, global.as_ref());
+            let has_code_index = idx.as_ref().is_some_and(|i| !i.files.is_empty());
+            if has_code_index {
+                if !out.is_empty() {
+                    out.push('\n');
+                    out.push_str(MAP_HINT);
+                } else {
+                    out = MAP_HINT.to_string();
+                }
+                session.spent += text::approx_tokens(MAP_HINT) as u64;
+            }
             let _ = session.save(&ses_dir);
             save(&m);
             if !out.is_empty() {
@@ -1308,7 +1348,7 @@ fn truncate_sig_map(sig: &str) -> String {
     if sig.is_empty() {
         String::new()
     } else {
-        let mut s = if sig.starts_with('(') || sig.starts_with('<') {
+        let mut s = if sig.starts_with('(') || sig.starts_with('<') || sig.starts_with(':') {
             sig.to_string()
         } else {
             format!(" {sig}")
@@ -1320,105 +1360,138 @@ fn truncate_sig_map(sig: &str) -> String {
     }
 }
 
-fn print_file_map(
-    repo: &Repo,
-    idx: &index::ProjectIndex,
-    entry: &index::FileEntry,
+fn print_file_map_result(
+    res: &index::FileMapResult,
     show_tests: bool,
-) -> Result<(), String> {
-    println!("{}:", entry.path);
+    m_opt: Option<&Memory>,
+    scores_opt: Option<&[score::Score]>,
+) {
+    println!("{}:", res.path);
 
-    let test_count = entry.symbols.iter().filter(|s| s.test).count();
+    match res.kind {
+        index::FileMapKind::NewFile => {
+            println!("archivo nuevo: aún no está en el índice");
+            if !res.direct_rules.is_empty() {
+                if let (Some(m), Some(scores)) = (m_opt, scores_opt) {
+                    println!("reglas:");
+                    for id in &res.direct_rules {
+                        let n = &m.nodes[*id as usize];
+                        println!("  {}", hook::render_node(m, scores, n));
+                    }
+                }
+            }
+            if !res.siblings.is_empty() {
+                println!("hermanos:");
+                for sib in &res.siblings {
+                    println!("  {}:", sib.path);
+                    if sib.public_symbols.is_empty() {
+                        println!("    (sin símbolos públicos)");
+                    } else {
+                        for s in &sib.public_symbols {
+                            let parent_str = s.parent.as_ref().map(|p| format!(" [{p}]")).unwrap_or_default();
+                            let sig_100 = truncate_sig_map(&s.signature);
+                            println!("    pub {} {}{sig_100} (L{}-L{}){}", s.kind, s.name, s.line, s.end_line, parent_str);
+                        }
+                    }
+                }
+            }
+        }
+        index::FileMapKind::NotIndexed => {
+            println!("no indexado");
+            if !res.direct_rules.is_empty() {
+                if let (Some(m), Some(scores)) = (m_opt, scores_opt) {
+                    println!("reglas:");
+                    for id in &res.direct_rules {
+                        let n = &m.nodes[*id as usize];
+                        println!("  {}", hook::render_node(m, scores, n));
+                    }
+                }
+            }
+        }
+        index::FileMapKind::Indexed => {
+            if !res.direct_rules.is_empty() {
+                if let (Some(m), Some(scores)) = (m_opt, scores_opt) {
+                    println!("reglas:");
+                    for id in &res.direct_rules {
+                        let n = &m.nodes[*id as usize];
+                        println!("  {}", hook::render_node(m, scores, n));
+                    }
+                }
+            }
+            if !res.neighbor_rules.is_empty() {
+                if let (Some(m), Some(scores)) = (m_opt, scores_opt) {
+                    println!("en vecinos:");
+                    for id in &res.neighbor_rules {
+                        let n = &m.nodes[*id as usize];
+                        println!("  {}", hook::render_node(m, scores, n));
+                    }
+                }
+            }
+            println!("importa:");
+            if res.imports.is_empty() {
+                println!("  (ninguna)");
+            } else {
+                for imp in &res.imports {
+                    println!("  {imp}");
+                }
+            }
+            println!("importado por:");
+            if res.imported_by.is_empty() {
+                println!("  (nadie)");
+            } else {
+                for imp_by in &res.imported_by {
+                    println!("  {imp_by}");
+                }
+            }
+            println!("símbolos:");
+            let test_count = res.symbols.iter().filter(|s| s.test).count();
+            let non_var_syms: Vec<_> = res
+                .symbols
+                .iter()
+                .filter(|s| s.kind != "var" && (show_tests || !s.test))
+                .collect();
+            let var_syms: Vec<_> = res
+                .symbols
+                .iter()
+                .filter(|s| s.kind == "var" && (show_tests || !s.test))
+                .collect();
 
-    // Separate primary symbols (functions, classes, constants) from module variables
-    let non_var_syms: Vec<_> = entry
-        .symbols
-        .iter()
-        .filter(|s| s.kind != "var" && (show_tests || !s.test))
-        .collect();
-    let var_syms: Vec<_> = entry
-        .symbols
-        .iter()
-        .filter(|s| s.kind == "var" && (show_tests || !s.test))
-        .collect();
+            let public_syms: Vec<_> = non_var_syms.iter().copied().filter(|s| s.public).collect();
+            let private_syms: Vec<_> = non_var_syms.iter().copied().filter(|s| !s.public).collect();
 
-    let public_syms: Vec<_> = non_var_syms.iter().copied().filter(|s| s.public).collect();
-    let private_syms: Vec<_> = non_var_syms.iter().copied().filter(|s| !s.public).collect();
-
-    for s in public_syms {
-        let parent_str = s.parent.as_ref().map(|p| format!(" [{p}]")).unwrap_or_default();
-        let sig_100 = truncate_sig_map(&s.signature);
-        println!("  pub {} {}{sig_100} (L{}-L{}){}", s.kind, s.name, s.line, s.end_line, parent_str);
-    }
-    for s in private_syms {
-        let parent_str = s.parent.as_ref().map(|p| format!(" [{p}]")).unwrap_or_default();
-        let sig_100 = truncate_sig_map(&s.signature);
-        println!("  {} {}{sig_100} (L{}-L{}){}", s.kind, s.name, s.line, s.end_line, parent_str);
-    }
-
-    if !var_syms.is_empty() {
-        if var_syms.len() > 10 && !show_tests {
-            println!("  {} variables de módulo (usa --tests para verlas)", var_syms.len());
-        } else {
-            for s in &var_syms {
-                let pub_prefix = if s.public { "pub " } else { "" };
+            for s in public_syms {
                 let parent_str = s.parent.as_ref().map(|p| format!(" [{p}]")).unwrap_or_default();
                 let sig_100 = truncate_sig_map(&s.signature);
-                println!("  {pub_prefix}{} {}{sig_100} (L{}-L{}){}", s.kind, s.name, s.line, s.end_line, parent_str);
+                println!("  pub {} {}{sig_100} (L{}-L{}){}", s.kind, s.name, s.line, s.end_line, parent_str);
+            }
+            for s in private_syms {
+                let parent_str = s.parent.as_ref().map(|p| format!(" [{p}]")).unwrap_or_default();
+                let sig_100 = truncate_sig_map(&s.signature);
+                println!("  {} {}{sig_100} (L{}-L{}){}", s.kind, s.name, s.line, s.end_line, parent_str);
+            }
+
+            if !var_syms.is_empty() {
+                if var_syms.len() > 10 && !show_tests {
+                    println!("  {} variables de módulo (usa --tests para verlas)", var_syms.len());
+                } else {
+                    for s in &var_syms {
+                        let pub_prefix = if s.public { "pub " } else { "" };
+                        let parent_str = s.parent.as_ref().map(|p| format!(" [{p}]")).unwrap_or_default();
+                        let sig_100 = truncate_sig_map(&s.signature);
+                        println!("  {pub_prefix}{} {}{sig_100} (L{}-L{}){}", s.kind, s.name, s.line, s.end_line, parent_str);
+                    }
+                }
+            }
+
+            if test_count > 0 && !show_tests {
+                println!("  {test_count} tests (usa --tests para verlos)");
+            }
+
+            if res.symbols.is_empty() {
+                println!("  (ninguno)");
             }
         }
     }
-
-    if test_count > 0 && !show_tests {
-        println!("  {test_count} tests (usa --tests para verlos)");
-    }
-
-    let (imports, imported_by) = index::file_neighbors(idx, &entry.path);
-    println!("importa:");
-    if imports.is_empty() {
-        println!("  (ninguna)");
-    } else {
-        for imp in &imports {
-            println!("  {imp}");
-        }
-    }
-
-    println!("importado por:");
-    if imported_by.is_empty() {
-        println!("  (nadie)");
-    } else {
-        for imp_by in &imported_by {
-            println!("  {imp_by}");
-        }
-    }
-
-    if repo.file.exists() {
-        let m = repo.load()?;
-        let scores = score::score_all(&m, &view(repo, &m));
-
-        let direct_rules = index::anchored_rules_for_file(&m, &scores, &entry.path);
-        if !direct_rules.is_empty() {
-            println!("reglas:");
-            for id in direct_rules {
-                let n = &m.nodes[id as usize];
-                println!("  {}", hook::render_node(&m, &scores, n));
-            }
-        }
-
-        let mut all_neighbors = imports;
-        all_neighbors.extend(imported_by);
-        let direct_all = index::anchored_rules_for_file(&m, &scores, &entry.path);
-        let neighbor_rules = index::neighbor_rules_for_file(&m, &scores, &all_neighbors, &direct_all);
-        if !neighbor_rules.is_empty() {
-            println!("en vecinos:");
-            for id in neighbor_rules {
-                let n = &m.nodes[id as usize];
-                println!("  {}", hook::render_node(&m, &scores, n));
-            }
-        }
-    }
-
-    Ok(())
 }
 
 fn walk_dir_rs(root: &Path, rel: &str, out: &mut Vec<String>) {
@@ -1683,5 +1756,67 @@ mod tests {
         std::env::set_current_dir(prev).unwrap();
         let _ = fs::remove_dir_all(&base);
     }
-}
 
+    #[test]
+    fn test_hook_map_hint_and_silent_panic() {
+        let base = std::env::temp_dir().join(format!("cthg-hint-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join(DIR)).unwrap();
+
+        let mut m = Memory::default();
+        let rule = Claim::rule("Regla base de prueba", "src/lib.rs");
+        learn::learn(&mut m, &rule, 100.0);
+        binary::save(&m, &base.join(DIR).join(FILE)).unwrap();
+
+        // 1. Without index: antigravity first turn does not contain MAP_HINT
+        let t_file = base.join("transcript.jsonl");
+        fs::write(&t_file, "").unwrap();
+        let payload1 = format!(
+            "{{\"conversationId\":\"conv-hint\",\"workspacePaths\":[\"{}\"],\"transcriptPath\":\"{}\"}}",
+            hook::escape_json(&base.to_string_lossy()),
+            hook::escape_json(&t_file.to_string_lossy())
+        );
+        let out1 = run_antigravity(&payload1).unwrap();
+        assert!(!out1.contains("Mapa del proyecto:"), "Should not contain hint without index: {out1}");
+
+        // Now create a real source file and an index with files
+        fs::create_dir_all(base.join("src")).unwrap();
+        fs::write(base.join("src").join("lib.rs"), "pub fn hello() {}").unwrap();
+        let mut index = index::ProjectIndex::default();
+        index.files.push(index::FileEntry {
+            path: "src/lib.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 10,
+            mtime: 1,
+            hash: 1,
+            status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![],
+            calls: vec![],
+        });
+        fs::write(base.join(DIR).join("indice.tsv"), index::format_index(&index)).unwrap();
+
+        // 2. With index on fresh conversation: contains MAP_HINT
+        let payload2 = format!(
+            "{{\"conversationId\":\"conv-hint-2\",\"workspacePaths\":[\"{}\"],\"transcriptPath\":\"{}\"}}",
+            hook::escape_json(&base.to_string_lossy()),
+            hook::escape_json(&t_file.to_string_lossy())
+        );
+        let out2 = run_antigravity(&payload2).unwrap();
+        assert!(out2.contains("Mapa del proyecto:"), "Should contain hint with index: {out2}");
+
+        // 3. Second call in same conversation: does not repeat MAP_HINT
+        let out3 = run_antigravity(&payload2).unwrap();
+        assert!(!out3.contains("Mapa del proyecto:"), "Should not repeat hint in second turn: {out3}");
+
+        // 4. Verify silent panic hook behavior
+        std::panic::set_hook(Box::new(|_| {}));
+        let res = std::panic::catch_unwind(|| {
+            panic!("test silent panic in hook execution");
+        });
+        assert!(res.is_err(), "panic should be caught without aborting");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+}

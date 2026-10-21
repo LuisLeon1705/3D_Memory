@@ -211,6 +211,48 @@ pub fn strip_comments_and_strings(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+
+fn advance_js_sig_tokens(tokens: &[Token], start: usize) -> (usize, Option<usize>) {
+    let n = tokens.len();
+    let mut j = start;
+    let mut paren: i32 = 0;
+    let mut bracket: i32 = 0;
+    let mut brace: i32 = 0;
+    let mut angle: i32 = 0;
+    let mut eq_pos: Option<usize> = None;
+
+    while j < n {
+        let t = tokens[j].text.as_str();
+        if paren == 0 && bracket == 0 && brace == 0 && angle == 0 {
+            if t == "{" || t == ";" {
+                break;
+            }
+            if t == "=" && eq_pos.is_none() {
+                eq_pos = Some(j);
+            }
+        }
+        match t {
+            "(" => paren += 1,
+            ")" => if paren > 0 { paren -= 1; },
+            "[" => bracket += 1,
+            "]" => if bracket > 0 { bracket -= 1; },
+            "{" => brace += 1,
+            "}" => if brace > 0 { brace -= 1; },
+            "<" => angle += 1,
+            ">" => {
+                if j > start && (tokens[j - 1].text == "=" || tokens[j - 1].text == "-") {
+                    // Part of `=>` or `->`
+                } else if angle > 0 {
+                    angle -= 1;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    (j, eq_pos)
+}
+
 pub fn scan_js_file(lang: Lang, bytes: &[u8]) -> FileScan {
     let clean = strip_comments_and_strings(bytes);
     scan_js(lang, &clean)
@@ -648,6 +690,16 @@ pub fn scan_js(_lang: Lang, source: &str) -> FileScan {
                 // Top-level module constant
                 let is_const = var_name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
                 if is_const {
+                    let mut type_sig = String::new();
+                    if i + 2 < n && tokens[i + 2].text == ":" {
+                        let (j, eq_pos) = advance_js_sig_tokens(&tokens, i + 2);
+                        let cut_end = eq_pos.unwrap_or(j);
+                        if cut_end <= n && i + 2 < cut_end {
+                            let end_offset = if cut_end < n { tokens[cut_end].offset } else { source.len() };
+                            let raw = &source[tokens[i + 2].offset..end_offset];
+                            type_sig = sanitize_signature(raw);
+                        }
+                    }
                     scan.symbols.push(Symbol {
                         name: var_name,
                         kind: "const".to_string(),
@@ -656,7 +708,7 @@ pub fn scan_js(_lang: Lang, source: &str) -> FileScan {
                         public: pending_export,
                         parent: None,
                         test: false,
-                        signature: String::new(),
+                        signature: type_sig,
                         decorators: Vec::new(),
                     });
                     pending_export = false;
@@ -670,13 +722,16 @@ pub fn scan_js(_lang: Lang, source: &str) -> FileScan {
             let name = tokens[i + 1].text.clone();
             let line = tok.line;
 
-            let mut j = i + 2;
-            while j < n && tokens[j].text != "{" && tokens[j].text != ";" {
-                j += 1;
-            }
+            let (j, eq_pos) = advance_js_sig_tokens(&tokens, i + 2);
+            let cut_end = if kind == "type" {
+                eq_pos.unwrap_or(j)
+            } else {
+                j
+            };
 
-            let sig_raw = if j <= n && i + 2 < j {
-                &source[tokens[i + 2].offset..tokens[j].offset]
+            let end_offset = if cut_end < n { tokens[cut_end].offset } else { source.len() };
+            let sig_raw = if cut_end <= n && i + 2 < cut_end {
+                &source[tokens[i + 2].offset..end_offset]
             } else {
                 ""
             };
@@ -980,5 +1035,35 @@ class StorageManager {
         assert_eq!(find_call("initApp").from, "(nivel de módulo)");
         assert_eq!(find_call("helper").from, "doWork");
         assert_eq!(find_call("persist").from, "StorageManager::save");
+    }
+
+    #[test]
+    fn js_const_and_type_strip_assignment_and_value() {
+        let ts = r#"
+export const API_TIMEOUT: number = 5000;
+export const DEFAULT_HOST = "localhost";
+export const BUF: [number, number] = [1, 2];
+export const MAP: Map<string, Array<number>> = new Map();
+export type UserId<T> = string | T;
+export type Pair = [number, number];
+"#;
+        let scan = scan_js_file(Lang::Ts, ts.as_bytes());
+        let const_sym = scan.symbols.iter().find(|s| s.name == "API_TIMEOUT").unwrap();
+        assert_eq!(const_sym.signature, ": number");
+
+        let host_sym = scan.symbols.iter().find(|s| s.name == "DEFAULT_HOST").unwrap();
+        assert_eq!(host_sym.signature, "");
+
+        let buf_sym = scan.symbols.iter().find(|s| s.name == "BUF").unwrap();
+        assert_eq!(buf_sym.signature, ": [number, number]");
+
+        let map_sym = scan.symbols.iter().find(|s| s.name == "MAP").unwrap();
+        assert_eq!(map_sym.signature, ": Map<string, Array<number>>");
+
+        let type_sym = scan.symbols.iter().find(|s| s.name == "UserId").unwrap();
+        assert_eq!(type_sym.signature, "<T>");
+
+        let pair_sym = scan.symbols.iter().find(|s| s.name == "Pair").unwrap();
+        assert_eq!(pair_sym.signature, "");
     }
 }

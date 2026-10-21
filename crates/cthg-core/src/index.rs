@@ -742,10 +742,123 @@ fn is_injectable_rule(node: &Node, score_opt: Option<&Score>) -> bool {
     true
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileMapKind {
+    Indexed,
+    NotIndexed,
+    NewFile,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileMapSibling {
+    pub path: String,
+    pub public_symbols: Vec<Symbol>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileMapResult {
+    pub path: String,
+    pub kind: FileMapKind,
+    pub direct_rules: Vec<u32>,
+    pub neighbor_rules: Vec<u32>,
+    pub imports: Vec<String>,
+    pub imported_by: Vec<String>,
+    pub symbols: Vec<Symbol>,
+    pub siblings: Vec<FileMapSibling>,
+}
+
+/// Computes the structured map for a given target path according to its presence in the index
+/// and on disk, ordering direct rules, neighbor rules, dependencies, and symbols.
+pub fn file_map(
+    idx: &ProjectIndex,
+    m: Option<&Memory>,
+    scores: &[Score],
+    target_path: &str,
+    exists_on_disk: bool,
+) -> FileMapResult {
+    let norm = spatial::normalize(target_path);
+    let empty_scores = Vec::new();
+    let actual_scores = if scores.is_empty() {
+        &empty_scores[..]
+    } else {
+        scores
+    };
+
+    if let Some(entry) = idx.get_file(&norm) {
+        let direct_rules = m.map(|mem| anchored_rules_for_file(mem, actual_scores, &norm)).unwrap_or_default();
+        let (imports, imported_by) = file_neighbors(idx, &norm);
+        let mut all_neighbors = imports.clone();
+        all_neighbors.extend(imported_by.clone());
+        let neighbor_rules = m.map(|mem| neighbor_rules_for_file(mem, actual_scores, &all_neighbors, &direct_rules)).unwrap_or_default();
+
+        FileMapResult {
+            path: norm,
+            kind: FileMapKind::Indexed,
+            direct_rules,
+            neighbor_rules,
+            imports,
+            imported_by,
+            symbols: entry.symbols.clone(),
+            siblings: Vec::new(),
+        }
+    } else if exists_on_disk {
+        let direct_rules = m.map(|mem| anchored_rules_for_file(mem, actual_scores, &norm)).unwrap_or_default();
+        FileMapResult {
+            path: norm,
+            kind: FileMapKind::NotIndexed,
+            direct_rules,
+            neighbor_rules: Vec::new(),
+            imports: Vec::new(),
+            imported_by: Vec::new(),
+            symbols: Vec::new(),
+            siblings: Vec::new(),
+        }
+    } else {
+        let direct_rules = m.map(|mem| anchored_rules_for_file(mem, actual_scores, &norm)).unwrap_or_default();
+        let parent = norm.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let mut siblings: Vec<FileMapSibling> = idx
+            .files
+            .iter()
+            .filter(|f| {
+                let f_parent = f.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                f_parent == parent && f.path != norm
+            })
+            .map(|f| {
+                let public_symbols = f
+                    .symbols
+                    .iter()
+                    .filter(|s| s.public && !s.test && s.kind != "var")
+                    .cloned()
+                    .collect();
+                FileMapSibling {
+                    path: f.path.clone(),
+                    public_symbols,
+                }
+            })
+            .collect();
+        siblings.sort_by(|a, b| a.path.cmp(&b.path));
+        siblings.truncate(5);
+
+        FileMapResult {
+            path: norm,
+            kind: FileMapKind::NewFile,
+            direct_rules,
+            neighbor_rules: Vec::new(),
+            imports: Vec::new(),
+            imported_by: Vec::new(),
+            symbols: Vec::new(),
+            siblings,
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use crate::learn::{self, Claim};
+    use crate::score::{self, View};
 
     #[test]
     fn format_round_trip() {
@@ -1151,5 +1264,101 @@ use super::model::*;
         let parsed = parse_index(&formatted).unwrap();
         assert_eq!(parsed.get_file("panic.rs").unwrap().status, "error");
     }
-}
 
+    #[test]
+    fn test_file_map_three_cases() {
+        let mut idx = ProjectIndex::default();
+        idx.files.push(FileEntry {
+            path: "src/main.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 100,
+            mtime: 1,
+            hash: 1,
+            status: "-".to_string(),
+            symbols: vec![Symbol {
+                name: "main".to_string(),
+                kind: "fn".to_string(),
+                line: 1,
+                end_line: 10,
+                public: true,
+                parent: None,
+                test: false,
+                signature: "()".to_string(),
+                decorators: vec![],
+            }],
+            imports: vec![crate::lang_rust::Import {
+                raw: "use crate::cli;".to_string(),
+                resolved: Some("src/cli.rs".to_string()),
+            }],
+            calls: vec![],
+        });
+        idx.files.push(FileEntry {
+            path: "src/cli.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 50,
+            mtime: 1,
+            hash: 2,
+            status: "-".to_string(),
+            symbols: vec![Symbol {
+                name: "parse".to_string(),
+                kind: "fn".to_string(),
+                line: 5,
+                end_line: 15,
+                public: true,
+                parent: None,
+                test: false,
+                signature: "() -> Args".to_string(),
+                decorators: vec![],
+            }],
+            imports: vec![],
+            calls: vec![],
+        });
+
+        let mut m = Memory::default();
+        let main_claim = Claim::rule("Regla de main.rs", "src/main.rs");
+        let cli_claim = Claim::rule("Regla de cli.rs", "src/cli.rs");
+        let src_claim = Claim::rule("Regla de src general", "src");
+        let cargo_claim = Claim::rule("Regla de Cargo.toml sobre tempfile", "Cargo.toml");
+
+        learn::learn(&mut m, &main_claim, 10.0);
+        learn::learn(&mut m, &cli_claim, 11.0);
+        learn::learn(&mut m, &src_claim, 12.0);
+        learn::learn(&mut m, &cargo_claim, 13.0);
+
+        let scores = score::score_all(&m, &View::all());
+
+        // Case 1: está en el índice -> Indexed
+        let map_main = file_map(&idx, Some(&m), &scores, "src/main.rs", true);
+        assert_eq!(map_main.kind, FileMapKind::Indexed);
+        // Direct rules should include main.rs and src (folder ancestor)
+        assert_eq!(map_main.direct_rules.len(), 2);
+        // Neighbor rules should include cli.rs (imported by main.rs)
+        assert_eq!(map_main.neighbor_rules.len(), 1);
+        assert_eq!(map_main.imports, vec!["src/cli.rs".to_string()]);
+        assert_eq!(map_main.symbols.len(), 1);
+        assert!(map_main.siblings.is_empty());
+
+        // Case 2: existe en disco pero no está en el índice -> NotIndexed
+        let map_cargo = file_map(&idx, Some(&m), &scores, "Cargo.toml", true);
+        assert_eq!(map_cargo.kind, FileMapKind::NotIndexed);
+        assert_eq!(map_cargo.direct_rules.len(), 1); // Cargo.toml rule
+        assert!(map_cargo.neighbor_rules.is_empty());
+        assert!(map_cargo.imports.is_empty());
+        assert!(map_cargo.symbols.is_empty());
+        assert!(map_cargo.siblings.is_empty());
+
+        // Case 3: no existe en disco -> NewFile
+        let map_new = file_map(&idx, Some(&m), &scores, "src/nuevo.rs", false);
+        assert_eq!(map_new.kind, FileMapKind::NewFile);
+        // Direct rules should include src rule
+        assert_eq!(map_new.direct_rules.len(), 1);
+        assert!(map_new.neighbor_rules.is_empty());
+        // Siblings in src/ should be cli.rs and main.rs (sorted, max 5)
+        assert_eq!(map_new.siblings.len(), 2);
+        assert_eq!(map_new.siblings[0].path, "src/cli.rs");
+        assert_eq!(map_new.siblings[0].public_symbols[0].name, "parse");
+        assert_eq!(map_new.siblings[1].path, "src/main.rs");
+        assert_eq!(map_new.siblings[1].public_symbols[0].name, "main");
+    }
+
+}

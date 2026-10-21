@@ -1,11 +1,17 @@
 ---
 name: project-memory
-description: Write to this repository's CTHG memory (`cthg`) every time the user corrects you, states a rule, confirms or rejects something, decides a plan or design, or when something breaks and gets fixed — and review the corrections the memory captured on its own (`[propuesta]`). Reading is automatic (hooks); writing is your job.
+description: Query the project's CTHG memory (`cthg map <path>`, `cthg where <sym>`, `cthg callers <sym>`) before writing or editing code, and write to memory every time the user corrects you, states a rule, confirms or rejects something, decides a plan or design, or when something breaks and gets fixed — and review captured corrections (`[propuesta]`). Automatic hooks push context; requested memory guides implementation.
 ---
 
 # Memoria del proyecto (`cthg`)
 
-Los hooks ya te inyectan lo relevante: núcleo, reglas del archivo que lees o escribes y reglas de lo que cambió. Esta skill es para **escribir**, y escribir es parte de la tarea, no un extra: si el usuario corrige algo y no lo guardas, mañana otro agente repetirá el error.
+Los hooks ya te inyectan lo relevante: núcleo, reglas del archivo que lees o escribes y reglas de lo que cambió. Esta skill es para **pedir el mapa** antes de escribir y para **guardar** lo que se aprenda. Escribir en la memoria es parte de la tarea, no un extra: si el usuario corrige algo y no lo guardas, mañana otro agente repetirá el error.
+
+## Antes de escribir código
+
+Antes de crear o editar cualquier archivo en el proyecto, pide su mapa con `cthg map <ruta>`. Trae las reglas del archivo, sus carpetas antecesoras, sus vecinos y sus símbolos o hermanos.
+Si vas a llamar a una función o tipo de otro archivo, búscalo con `cthg where <símbolo>` o consulta quién lo llama con `cthg callers <símbolo>` en vez de explorar a ciegas con `grep`.
+Si el mapa te enseña una regla anclada que contradice tu plan o tu instrucción, **dilo explícitamente antes de escribir** para alinear el diseño o actualizar la regla con `--supersedes`.
 
 ## Cuándo escribir
 

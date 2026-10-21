@@ -152,6 +152,52 @@ pub fn strip_comments_and_strings(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+
+fn split_eq_depth0(s: &str) -> Option<(&str, &str)> {
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    for (i, c) in s.char_indices() {
+        if paren == 0 && bracket == 0 && brace == 0 && c == '=' {
+            if s[i..].starts_with("==") {
+                return None;
+            }
+            return Some((&s[..i], &s[i + 1..]));
+        }
+        match c {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_colon_depth0(s: &str) -> Option<(&str, &str)> {
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    for (i, c) in s.char_indices() {
+        if paren == 0 && bracket == 0 && brace == 0 && c == ':' {
+            return Some((&s[..i], &s[i + 1..]));
+        }
+        match c {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            _ => {}
+        }
+    }
+    None
+}
+
 pub fn scan_python_file(bytes: &[u8]) -> FileScan {
     let clean = strip_comments_and_strings(bytes);
     scan_python(&clean)
@@ -402,13 +448,17 @@ pub fn scan_python(source: &str) -> FileScan {
 
         // Module-level assignments (indent 0, outside main block)
         if indent == 0 && main_block_indent.is_none() && scope_stack.is_empty() {
-            if let Some((lhs, rhs)) = trimmed.split_once('=') {
-                let var_name = lhs.trim().split(':').next().unwrap_or("").trim();
+            if let Some((lhs, _rhs)) = split_eq_depth0(trimmed) {
+                let var_name = split_colon_depth0(lhs).map(|(n, _)| n).unwrap_or(lhs).trim();
                 if is_ident(var_name) && !var_name.starts_with("if ") {
                     let is_public = is_name_public(var_name, all_exports.as_ref());
                     let is_const = var_name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
                     let kind = if is_const { "const" } else { "var" };
-                    let sig = sanitize_signature(rhs.trim());
+                    let sig = if let Some((_, typ)) = split_colon_depth0(lhs) {
+                        sanitize_signature(&format!(": {}", typ.trim()))
+                    } else {
+                        String::new()
+                    };
 
                     scan.symbols.push(Symbol {
                         name: var_name.to_string(),
@@ -852,5 +902,26 @@ if __name__ == "__main__":
 
         let res_ext = resolve_import("app.py", "import requests", &paths);
         assert_eq!(res_ext, None);
+    }
+
+    #[test]
+    fn python_const_and_var_strip_assignment_and_value() {
+        let code = r#"
+TIMEOUT: int = 30
+DEBUG = True
+CACHE: dict[str, list[int]] = {}
+"#;
+        let scan = scan_python_file(code.as_bytes());
+        let timeout_sym = scan.symbols.iter().find(|s| s.name == "TIMEOUT").unwrap();
+        assert_eq!(timeout_sym.kind, "const");
+        assert_eq!(timeout_sym.signature, ": int");
+
+        let debug_sym = scan.symbols.iter().find(|s| s.name == "DEBUG").unwrap();
+        assert_eq!(debug_sym.kind, "const");
+        assert_eq!(debug_sym.signature, "");
+
+        let cache_sym = scan.symbols.iter().find(|s| s.name == "CACHE").unwrap();
+        assert_eq!(cache_sym.kind, "const");
+        assert_eq!(cache_sym.signature, ": dict[str, list[int]]");
     }
 }
