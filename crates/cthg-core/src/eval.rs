@@ -9,6 +9,7 @@
 
 use super::hook::{self, SessionState};
 use super::import;
+use super::index::ProjectIndex;
 use super::model::*;
 use super::retrieve::{self, Query};
 use super::score::{self, Score, View};
@@ -155,16 +156,19 @@ pub enum Config {
     EspacialLectura,
     /// Channels 0–3, with per-session deduplication, as the hooks run.
     Todo,
+    /// Channels 0–3 with code graph neighbors and identifiers.
+    TodoVecinos,
 }
 
 impl Config {
-    pub const ALL: [Config; 6] = [
+    pub const ALL: [Config; 7] = [
         Config::Completo,
         Config::AnidadoIdeal,
         Config::SoloLexico,
         Config::Espacial,
         Config::EspacialLectura,
         Config::Todo,
+        Config::TodoVecinos,
     ];
 
     pub fn name(self) -> &'static str {
@@ -175,19 +179,20 @@ impl Config {
             Config::Espacial => "espacial",
             Config::EspacialLectura => "espacial + lectura",
             Config::Todo => "todo",
+            Config::TodoVecinos => "todo + vecinos",
         }
     }
 
     fn lexical(self) -> bool {
-        matches!(self, Config::SoloLexico | Config::Todo)
+        matches!(self, Config::SoloLexico | Config::Todo | Config::TodoVecinos)
     }
 
     fn spatial(self) -> bool {
-        matches!(self, Config::AnidadoIdeal | Config::Espacial | Config::EspacialLectura | Config::Todo)
+        matches!(self, Config::AnidadoIdeal | Config::Espacial | Config::EspacialLectura | Config::Todo | Config::TodoVecinos)
     }
 
     fn reads(self) -> bool {
-        matches!(self, Config::AnidadoIdeal | Config::EspacialLectura | Config::Todo)
+        matches!(self, Config::AnidadoIdeal | Config::EspacialLectura | Config::Todo | Config::TodoVecinos)
     }
 }
 
@@ -304,7 +309,23 @@ fn git_targets(case: &Case) -> Vec<Target> {
 }
 
 /// Runs one channel configuration the way the hooks would. Returns (tokens, injected node ids).
-fn simulate(base: &Memory, case: &Case, cfg: Config) -> (usize, Vec<u32>) {
+/// Weights for code graph routing evaluation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EvalWeights {
+    pub w_neighbor: f32,
+    pub w_symbol: f32,
+}
+
+impl Default for EvalWeights {
+    fn default() -> Self {
+        Self {
+            w_neighbor: spatial::W_NEIGHBOR,
+            w_symbol: spatial::W_SYMBOL,
+        }
+    }
+}
+
+fn simulate(base: &Memory, case: &Case, cfg: Config, index: Option<&ProjectIndex>, weights: EvalWeights) -> (usize, Vec<u32>) {
     let mut m = base.clone();
     let view = View::all();
     if cfg == Config::AnidadoIdeal {
@@ -325,17 +346,26 @@ fn simulate(base: &Memory, case: &Case, cfg: Config) -> (usize, Vec<u32>) {
     let mut out = hook::handle_session_start(&mut m, &view, &mut session);
     let prompt = if cfg.lexical() { case.prompt.as_str() } else { "" };
     let targets = if cfg.spatial() { git_targets(case) } else { vec![] };
-    out.push_str(&hook::handle_prompt(&mut m, &view, &mut session, prompt, targets));
-    if cfg.reads() {
-        for p in &case.read {
-            out.push_str(&hook::read_context(&mut m, &view, &mut session, p));
+    if cfg == Config::TodoVecinos {
+        out.push_str(&hook::handle_prompt_with_weights(&mut m, &view, &mut session, prompt, targets, index, weights.w_neighbor, weights.w_symbol));
+        if cfg.reads() {
+            for p in &case.read {
+                out.push_str(&hook::read_context_with_weights(&mut m, &view, &mut session, p, index, weights.w_neighbor));
+            }
+        }
+    } else {
+        out.push_str(&hook::handle_prompt(&mut m, &view, &mut session, prompt, targets));
+        if cfg.reads() {
+            for p in &case.read {
+                out.push_str(&hook::read_context(&mut m, &view, &mut session, p));
+            }
         }
     }
     (text::approx_tokens(&out), session.injected)
 }
 
 /// Why a relevant node was not injected under `cfg`: the first cause that applies.
-fn diagnose(m: &Memory, scores: &[Score], case: &Case, cfg: Config, id: u32) -> MissReason {
+fn diagnose(m: &Memory, scores: &[Score], case: &Case, cfg: Config, id: u32, index: Option<&ProjectIndex>, weights: EvalWeights) -> MissReason {
     let n = &m.nodes[id as usize];
     let s = scores[id as usize];
     if !s.visible || s.chi <= -0.25 {
@@ -348,12 +378,23 @@ fn diagnose(m: &Memory, scores: &[Score], case: &Case, cfg: Config, id: u32) -> 
         }
         let mut found = false;
         let prompt = if cfg.lexical() { case.prompt.clone() } else { String::new() };
-        let targets = if cfg.spatial() { git_targets(case) } else { vec![] };
+        let mut targets = if cfg.spatial() { git_targets(case) } else { vec![] };
+        if cfg == Config::TodoVecinos {
+            let mut all_targets = spatial::expand_neighbors(&targets, index, weights.w_neighbor, spatial::MAX_NEIGHBORS);
+            let id_targets = spatial::identifier_targets(&prompt, index, weights.w_symbol, spatial::MIN_IDENT_LEN, spatial::MAX_DEFS);
+            spatial::merge_targets(&mut all_targets, id_targets);
+            targets = all_targets;
+        }
         let q = Query { text: prompt, targets };
         found |= retrieve::recall(m, scores, &q, usize::MAX, -1.0).iter().any(|r| r.id == id);
         if cfg.reads() {
             for p in &case.read {
-                let q = Query { text: String::new(), targets: vec![Target::new(p, 1.0)] };
+                let targets = if cfg == Config::TodoVecinos {
+                    spatial::expand_neighbors(&[Target::new(p, 1.0)], index, weights.w_neighbor, spatial::MAX_NEIGHBORS)
+                } else {
+                    vec![Target::new(p, 1.0)]
+                };
+                let q = Query { text: String::new(), targets };
                 found |= retrieve::recall(m, scores, &q, usize::MAX, -1.0).iter().any(|r| r.id == id);
             }
         }
@@ -372,7 +413,7 @@ fn diagnose(m: &Memory, scores: &[Score], case: &Case, cfg: Config, id: u32) -> 
     }
 }
 
-fn evaluate_case(imp: &Imported, case: &Case, items: usize, full_tokens: usize) -> CaseResult {
+fn evaluate_case(imp: &Imported, case: &Case, items: usize, full_tokens: usize, index: Option<&ProjectIndex>, weights: EvalWeights) -> CaseResult {
     let scores = score::score_all(&imp.m, &View::all());
     let mut outcomes = Vec::new();
     for cfg in Config::ALL {
@@ -388,7 +429,7 @@ fn evaluate_case(imp: &Imported, case: &Case, items: usize, full_tokens: usize) 
             });
             continue;
         }
-        let (tokens, injected) = simulate(&imp.m, case, cfg);
+        let (tokens, injected) = simulate(&imp.m, case, cfg, index, weights);
         let mut misses = Vec::new();
         let mut hits = 0usize;
         for &(line, critical) in &case.relevant {
@@ -397,7 +438,7 @@ fn evaluate_case(imp: &Imported, case: &Case, items: usize, full_tokens: usize) 
                     hits += 1;
                     continue;
                 }
-                Some(&id) => diagnose(&imp.m, &scores, case, cfg, id),
+                Some(&id) => diagnose(&imp.m, &scores, case, cfg, id, index, weights),
                 None => match imp.merged.get(&line) {
                     Some(&into) => MissReason::Merged(line_of(&imp.m.nodes[into as usize]).unwrap_or(0)),
                     None => MissReason::NotImported,
@@ -421,7 +462,15 @@ fn evaluate_case(imp: &Imported, case: &Case, items: usize, full_tokens: usize) 
 /// Evaluates `markdown` (whose lines `casos.md` refers to) against every labelled case.
 /// `resolve` answers which repo path a mention names (see `import::RepoFiles`).
 /// `auto_core` ignores the `core:` lines and uses import's own proposal, to compare the two.
-pub fn run(source: &str, markdown: &str, file: &CaseFile, resolve: &dyn Fn(&str) -> Option<String>, auto_core: bool) -> EvalReport {
+pub fn run_with_index_and_weights(
+    source: &str,
+    markdown: &str,
+    file: &CaseFile,
+    resolve: &dyn Fn(&str) -> Option<String>,
+    auto_core: bool,
+    index: Option<&ProjectIndex>,
+    weights: EvalWeights,
+) -> EvalReport {
     let full_tokens = text::approx_tokens(markdown);
     let mut report = EvalReport {
         source: source.to_string(),
@@ -451,9 +500,27 @@ pub fn run(source: &str, markdown: &str, file: &CaseFile, resolve: &dyn Fn(&str)
                 report.core_unknown.push(l);
             }
         }
-        report.cases.push(evaluate_case(imp, case, imp.blocks, full_tokens));
+        report.cases.push(evaluate_case(imp, case, imp.blocks, full_tokens, index, weights));
     }
     report
+}
+
+pub fn run_with_index(
+    source: &str,
+    markdown: &str,
+    file: &CaseFile,
+    resolve: &dyn Fn(&str) -> Option<String>,
+    auto_core: bool,
+    index: Option<&ProjectIndex>,
+) -> EvalReport {
+    run_with_index_and_weights(source, markdown, file, resolve, auto_core, index, EvalWeights::default())
+}
+
+/// Evaluates `markdown` (whose lines `casos.md` refers to) against every labelled case.
+/// `resolve` answers which repo path a mention names (see `import::RepoFiles`).
+/// `auto_core` ignores the `core:` lines and uses import's own proposal, to compare the two.
+pub fn run(source: &str, markdown: &str, file: &CaseFile, resolve: &dyn Fn(&str) -> Option<String>, auto_core: bool) -> EvalReport {
+    run_with_index(source, markdown, file, resolve, auto_core, None)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -548,11 +615,28 @@ pub fn render_markdown(r: &EvalReport, title: &str) -> String {
             mark(t.recall >= 0.95)
         ));
     }
+    if let Some(tv) = sums.iter().find(|x| x.config == Config::TodoVecinos) {
+        s.push_str(&format!(
+            "Criterio (`todo + vecinos`): ahorro ≥ 70 % {} · críticas perdidas = 0 {} · recall ≥ 95 % {}\n",
+            mark(tv.saving >= 0.70),
+            mark(tv.critical_missed == 0),
+            mark(tv.recall >= 0.95)
+        ));
+    }
 
     s.push_str("\n## Por caso (`todo`)\n\n| Caso | Tokens | Recall | Críticas perdidas |\n|---|---:|---:|---:|\n");
     for c in &r.cases {
         if let Some(o) = c.outcomes.iter().find(|o| o.config == Config::Todo) {
             s.push_str(&format!("| {} | {} | {} | {} |\n", c.name, o.tokens, pct(o.recall), o.critical_missed()));
+        }
+    }
+
+    if sums.iter().any(|x| x.config == Config::TodoVecinos) {
+        s.push_str("\n## Por caso (`todo + vecinos`)\n\n| Caso | Tokens | Recall | Críticas perdidas |\n|---|---:|---:|---:|\n");
+        for c in &r.cases {
+            if let Some(o) = c.outcomes.iter().find(|o| o.config == Config::TodoVecinos) {
+                s.push_str(&format!("| {} | {} | {} | {} |\n", c.name, o.tokens, pct(o.recall), o.critical_missed()));
+            }
         }
     }
 
@@ -637,7 +721,7 @@ mod tests {
              ## caso: colisionador\nprompt: arréglalo\ngit: src/core/collider.rs\nrelevantes: L2!, L3, L4, L5, L6!, L7, L99\n",
         )
         .unwrap();
-        let r = run("CLAUDE.md", MD, &cases, &exists, false);
+        let r = run("CLAUDE.md", MD, &cases, &|p| Some(p.to_string()), false);
         assert_eq!(r.merged, 1, "L7 repeats L5");
         let c = &r.cases[0];
         let get = |cfg: Config| c.outcomes.iter().find(|o| o.config == cfg).unwrap();
@@ -668,7 +752,7 @@ mod tests {
 prompt: ¿qué aspecto tiene la interfaz?
 relevantes: L5
 ").unwrap();
-        let r2 = run("CLAUDE.md", MD, &q, &exists, false);
+        let r2 = run("CLAUDE.md", MD, &q, &|p| Some(p.to_string()), false);
         let todo2 = r2.cases[0].outcomes.iter().find(|o| o.config == Config::Todo).unwrap();
         assert_eq!(reason(todo2, 5), Some(MissReason::NoLexicalMatch));
 
@@ -684,14 +768,14 @@ relevantes: L5
             md.push_str(&format!("- En `src/core/collider.rs` alfa{i} beta{i} gamma{i} delta{i} epsilon{i} zeta{i} theta{i} kappa{i}.\n"));
         }
         let cases = parse_cases("## caso: muchas\ngit: src/core/collider.rs\nrelevantes: L2, L61\n").unwrap();
-        let r = run("CLAUDE.md", &md, &cases, &exists, false);
+        let r = run("CLAUDE.md", &md, &cases, &|p| Some(p.to_string()), false);
         let todo = r.cases[0].outcomes.iter().find(|o| o.config == Config::Todo).unwrap();
         assert!(todo.misses.iter().any(|m| m.reason == MissReason::OverBudget), "{:?}", todo.misses);
 
         // A plan is invisible until it happens: χ = −1.
         let plan_md = "# Plan\n- [ ] Pendiente: migrar `src/core/collider.rs` a f64.\n";
         let cases = parse_cases("## caso: plan\ngit: src/core/collider.rs\nrelevantes: L2\n").unwrap();
-        let r = run("CLAUDE.md", plan_md, &cases, &exists, false);
+        let r = run("CLAUDE.md", plan_md, &cases, &|p| Some(p.to_string()), false);
         let todo = r.cases[0].outcomes.iter().find(|o| o.config == Config::Todo).unwrap();
         assert_eq!(todo.misses[0].reason, MissReason::LowChi);
     }
@@ -699,11 +783,62 @@ relevantes: L5
     #[test]
     fn report_is_deterministic_and_marks_the_criterion() {
         let cases = parse_cases("core: L2\n## caso: a\nprompt: arréglalo\ngit: src/core/collider.rs\nrelevantes: L2!, L3\n## caso: b\nrelevantes:\n").unwrap();
-        let a = render_markdown(&run("CLAUDE.md", MD, &cases, &exists, false), "prueba");
-        let b = render_markdown(&run("CLAUDE.md", MD, &cases, &exists, false), "prueba");
+        let a = render_markdown(&run("CLAUDE.md", MD, &cases, &|p| Some(p.to_string()), false), "prueba");
+        let b = render_markdown(&run("CLAUDE.md", MD, &cases, &|p| Some(p.to_string()), false), "prueba");
         assert_eq!(a, b);
         assert!(a.contains("Sin etiquetar (no cuentan): b"));
         assert!(a.contains("Criterio (`todo`)"));
         assert!(a.contains("| todo |"));
+    }
+
+    #[test]
+    fn todo_vecinos_with_index() {
+        use crate::index::{FileEntry, ProjectIndex};
+        use crate::lang_rust::Import;
+
+        let cases = parse_cases(
+            "core: L2\n\
+             ## caso: colisionador\nprompt: arreglalo\ngit: src/core/collider.rs\nrelevantes: L3, L5\n",
+        )
+        .unwrap();
+
+        // Without index: L3 is hit (direct), L5 is missed (PathMismatch)
+        let r_no_idx = run("CLAUDE.md", MD, &cases, &exists, false);
+        let o_todo = r_no_idx.cases[0].outcomes.iter().find(|o| o.config == Config::Todo).unwrap();
+        assert_eq!(o_todo.recall, 0.5, "L3 hit, L5 missed without neighbors");
+
+        // With index: src/core/collider.rs imports src/ui/button.rs
+        let mut index = ProjectIndex::default();
+        index.files.push(FileEntry {
+            path: "src/core/collider.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 100,
+            mtime: 1,
+            hash: 1,
+                    status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![Import {
+                raw: "use crate::ui::button;".to_string(),
+                resolved: Some("src/ui/button.rs".to_string()),
+            }],
+            calls: vec![],
+        });
+        index.files.push(FileEntry {
+            path: "src/ui/button.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 100,
+            mtime: 1,
+            hash: 2,
+                    status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![],
+            calls: vec![],
+        });
+
+        let r_idx = run_with_index("CLAUDE.md", MD, &cases, &exists, false, Some(&index));
+        let o_todo_after = r_idx.cases[0].outcomes.iter().find(|o| o.config == Config::Todo).unwrap();
+        let o_vec_after = r_idx.cases[0].outcomes.iter().find(|o| o.config == Config::TodoVecinos).unwrap();
+        assert_eq!(o_todo_after.recall, 0.5, "Todo without index ignores neighbors");
+        assert_eq!(o_vec_after.recall, 1.0, "TodoVecinos captures neighbor rule L5");
     }
 }

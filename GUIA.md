@@ -198,6 +198,23 @@ Se descartan los lockfiles y `target/`, `node_modules/`, `dist/`, `build/`, `.ct
 
 **Símbolos tocados**: para cada hunk se lee el archivo y se busca hacia arriba, desde la primera línea del hunk, la declaración más cercana (`fn`, `def`, `function`, `class`, `impl`…; los comentarios no cuentan). La cabecera `@@` de git no basta: para un método indentado muestra `impl Collider {`, y una regla anclada en el método editado quedaba penalizada con σ = 0,5. Se guardan los dos (`resolve_contacts` y `Collider`), así las reglas ancladas al tipo también coinciden.
 
+**Vecinos e identificadores del grafo de código (Fase 8b)**:
+
+Cuando se dispone del índice de código derivado (`.cthg/indice.tsv`), el canal espacial se enriquece con la topología real del código:
+1. **Vecinos de importación (1 salto)**: cada objetivo espacial $t$ (archivo leído en lectura JIT, editado o modificado en git) expande como objetivos a sus vecinos inmediatos (lo que importa y lo que lo importa):
+   $$\text{peso}(v) = W_{\text{vecino}} \cdot \text{peso}(t), \quad W_{\text{vecino}} = 0,5$$
+   - Máximo 6 vecinos por objetivo (`MAX_VECINOS = 6`), ordenados descendentemente por número de enlaces entre ambos archivos.
+   - Estrictamente a un salto: nunca se admiten vecinos de vecinos.
+   - Si un archivo ya era un objetivo directo, conserva el peso mayor y mantiene su condición de objetivo directo.
+2. **Identificadores en el mensaje**: los identificadores presentes en el texto del prompt que coinciden exactamente (sensibles a mayúsculas, incluyendo `Tipo::metodo`) con símbolos del índice:
+   - Convierten en objetivo espacial a su archivo de definición con peso $W_{\text{símbolo}} = 0,9$.
+   - Asignan dicho símbolo a `Target.symbols`, permitiendo que el factor $\sigma$ distinga reglas del símbolo frente a otras del mismo archivo.
+   - Filtros de relevancia: se descartan identificadores de menos de 4 caracteres (`MIN_IDENT_LEN = 4`), símbolos definidos en más de 3 archivos (`MAX_DEFS = 3`) y símbolos declarados dentro de módulos de prueba (`mod tests`).
+3. **Desempate directo vs. vecino**: si una regla llega a la vez por vía directa y como vecina, la vía directa prevalece estrictamente (afinidad directa íntegra, sin atenuación y sin prefijo `vecino de`).
+4. **Atribución explícita**: la regla inyectada comunica al agente el motivo del enrutamiento:
+   `- #3 regla (src/cli.rs, vecino de src/main.rs): ...`
+5. **Invariante de propuestas**: un recuerdo en estado de propuesta (`PROPOSED`) solo se desbloquea leyendo su propio archivo directo (`may_inject(n, Some(read_path))`), nunca a través de vecindad.
+
 **Fusión**:
 
 ```
@@ -301,6 +318,17 @@ El prompt es «arréglalo» y en `git status` está modificado `src/core/collide
 | #3 | 2·0,8·0,8 = 1,28 | 1,28 | **1,14** |
 | #4 | 0 | 0 | — (fuera) |
 
+#### Ejemplo con vecinos del grafo de código
+
+Si el archivo `src/main.rs` importa `src/cli.rs` (enlace de 1 salto) y se edita `src/main.rs` (peso objetivo = 1,0):
+- Objetivo directo: `src/main.rs`, peso = 1,0.
+- Objetivo vecino derivado: `src/cli.rs`, peso = $0,5 \cdot 1,0 = 0,5$, `neighbor_of = Some("src/main.rs")`.
+- Para una regla $n$ anclada en `src/cli.rs`:
+  - Afinidad directa desde `src/main.rs`: 0 (no es antecesor ni idéntico en el árbol).
+  - Afinidad desde el vecino: $\text{peso}(v) \cdot \lambda^0 \cdot \sigma = 0,5 \cdot 1,0 \cdot 1,0 = 0,50$.
+  - Semilla espacial: $s(n) = 0 + 2 \cdot 0,50 = 1,00$.
+  - Línea inyectada: `- #3 regla (src/cli.rs, vecino de src/main.rs): ...`
+
 Salida real de `cthg recall --prompt "arréglalo" --git`:
 
 ```
@@ -329,6 +357,32 @@ Entrar por la ruta es la pieza más importante: es determinista y no depende de 
 | Fuera de git | no hay `status` | canales 0, 2 y 3 siguen funcionando |
 
 Riesgo residual: una regla crítica que no es `CORE` y está mal anclada. Es medible (sección 12): cada fallo se lista y se corrige.
+
+### 5.1 Índice del proyecto (grafo de código)
+
+El canal espacial original solo conocía el árbol de carpetas (en `spatial.rs`: un ancla que no es el objetivo ni su antecesor da afinidad 0) y solo identificaba símbolos tocados mediante los hunks de `git diff`. La persona o el agente debían construir el mapa del código a mano explorando con `grep` y `view_file`. La fase 8 automatiza este entendimiento estructural.
+
+#### Decisiones de diseño (memorias #46 y #48)
+- **Índice derivado y reconstruible, no memoria**:
+  - No entra en `memoria.cthg` (no incrementa `VERSION` de `binary.rs`).
+  - No cuenta en $S$ (`hook::memory_size`).
+  - Nunca se inyecta como regla en el contexto del agente.
+  - *Motivo*: $Y$ solo avanza hacia delante, mientras que el código cambia y se refactoriza continuamente; almacenar el AST o grafo de código como nodos de memoria dejaría basura histórica permanente e inflaría desproporcionadamente los presupuestos de contexto.
+- **Qué se extrae**: archivos, símbolos de primer nivel (`fn`, métodos con su tipo contenedor `parent`, `struct`, `enum`, `trait`, `type`, `const`, `static`, `mod`, `macro_rules!`, `class`, `interface`, `var`, `id`), sus **firmas** (`signature`: qué reciben y devuelven, hasta 160 caracteres), decoradores en Python (`decorators`), importaciones resueltas entre archivos del repositorio y llamadas símbolo → nombre. Las variables locales **no** se extraen (son ruido y no enrutan reglas).
+- **Lenguajes soportados (Fase 8c)**: Rust (`lang_rust.rs`), Python (`lang_python.rs`), JavaScript y TypeScript (`lang_js.rs`, incluidos JSX y TSX) y HTML (`lang_html.rs`). Las llamadas se aíslan por familias de lenguajes (`Web`, `Python`, `Rust`) para que `callers` no mezcle llamadas homónimas de stacks distintos.
+- **Lo diferido a la fase 8f**: la base de datos (tablas, consultas por función, modelos ORM) y las rutas HTTP quedan para la 8f. La 8c preserva los decoradores de Python para que la 8f no requiera cambiar la versión del formato de índice.
+- **Sin dependencias**: escáneres léxicos escritos a mano en `cthg-core`, sin parsers pesados ni ASTs externos.
+- **Almacenamiento**: `.cthg/indice.tsv` (formato TSV plano `cthg-indice 2`, con escritura atómica mediante PID temporal `.cthg/indice.tsv.<pid>.tmp`). Se ignora en Git mediante `.cthg/.gitignore`.
+
+#### Fases del grafo de código (8a - 8f)
+- **8a (completada)**: Escáner de Rust, `.cthg/indice.tsv`, comandos CLI `cthg index`, `cthg map`, `cthg where` y `cthg callers`.
+- **8b (completada)**: Enrutado por vecinos e identificadores de código con eval (el canal espacial propaga afinidad hacia importaciones directas a 1 salto e identificadores del prompt; actualización del índice en `session-start` y primer turno de Antigravity con timeout de 500 ms).
+- **8c (completada)**: Escáneres políglotas (Python, JS/TS, HTML), firmas en todos los lenguajes, decoradores de Python, formato v2 y filtros de bundle/ruido.
+- **8d**: Canal pedido: skill y hooks orientan al modelo hacia `cthg map`.
+- **8e**: Visor 3D (`memviz`): visualización interactiva del grafo de código y la memoria causal.
+- **8f**: Base de datos y rutas HTTP: tablas y consultas por función, modelos ORM, decoradores de ruta; diseñarla tras verla en un proyecto real.
+
+*(Nota de ordenación: la fase 8 se implementa antes de la fase 7 para acelerar la orientación de los agentes).*
 
 ---
 
@@ -559,6 +613,12 @@ Ejemplo con números (prior de `importado` (5; 1,5) → A = 0,54; e = 4,5 → w 
 │  │     ├─ json.rs           lector JSON mínimo (sin dependencias)
 │  │     ├─ verify.rs         verificar rutas, símbolos, dependencias y comandos contra el repo
 │  │     ├─ eval.rs           medición: casos, 6 configuraciones, métricas, diagnóstico de fallos
+│  │     ├─ index.rs          índice derivado del código: construcción, persistencia v2 y consultas
+│  │     ├─ lang.rs           despacho multilingüe, familias de lenguajes y tipos compartidos
+│  │     ├─ lang_rust.rs      escáner de Rust y resolución de módulos/crates
+│  │     ├─ lang_python.rs    escáner de Python, decoradores, `__all__` e importaciones
+│  │     ├─ lang_js.rs        escáner de JS/TS (JSX/TSX), clases, métodos e importaciones
+│  │     ├─ lang_html.rs      escáner de HTML: scripts, eventos `onclick` e IDs
 │  │     ├─ text.rs           tokens es/en, similitud, recortes, tokens aproximados
 │  │     └─ binary.rs         formato .cthg (CRC32, guardado atómico)
 │  └─ cthg-cli/               binario `cthg`
@@ -590,7 +650,11 @@ En cada proyecto que use la memoria: `<repo>/.cthg/memoria.cthg` (+ `.bak`), `<r
 | `cthg confirm N` / `cthg deny N` | ✅ | α + 1 / β + 1 (lo anclado no se mueve); `confirm` es lo único que convierte una corrección capturada (`[propuesta]`) en regla inyectable |
 | `cthg core [<id>… [--unset]] [--budget N]` | ✅ | canal 0 tal como se inyecta (global y proyecto); con ids, marca o desmarca `CORE`. Avisa si el núcleo no cabe en el presupuesto |
 | `cthg <init\|learn\|confirm\|deny\|core\|list\|import> --global` | ✅ | lo mismo sobre la memoria global (sección 8.1) |
-| `cthg recall [--prompt T] [--path P]… [--git] [--budget N] [--limit N]` | ✅ | canales 1–3 (rutas, símbolos de `git diff`, renombres `-M`) |
+| `cthg recall [--prompt T] [--path P]… [--git] [--budget N] [--limit N] [--sin-vecinos]` | ✅ | canales 1–3 (rutas, símbolos de `git diff`, renombres `-M`, vecinos del grafo de código e identificadores) |
+| `cthg index [--rebuild]` | ✅ | actualiza o reconstruye `.cthg/indice.tsv` (formato v2); omite ruido y bundles |
+| `cthg map [ruta] [--limit N] [--tests]` | ✅ | mapa de símbolos de un archivo con firmas (truncadas a ~100 caracteres) y reglas asociadas y en vecinos; resume variables de módulo de Python si superan 10 |
+| `cthg where <símbolo>` | ✅ | busca declaraciones de un símbolo mostrando su ruta, línea, tipo y firma completa `{ruta}:{linea} {tipo} {nombre}{firma}` |
+| `cthg callers <símbolo> [--tests]` | ✅ | busca quién llama a un símbolo en el grafo de código, respetando aislamiento entre familias de lenguajes (`Web`, `Python`, `Rust`) |
 | `cthg list [--all]` | ✅ | todos los nodos con χ, flags (incluido `obsoleto`) y rama |
 | `cthg mv <de> <a>` | ✅ | la memoria sigue a un archivo o carpeta movidos |
 | `cthg import <archivo.md> [--yes]` | ✅ | parte el archivo en nodos y propone un `CORE` ordenado que cabe en el presupuesto de núcleo (secciones 4.4 y 12.6); cada nodo guarda su origen en `key` (`CLAUDE.md:L12`) y su contexto (sección 12.5). Reimportar el archivo editado sustituye lo cambiado, marca `STALE` lo borrado y lista qué es nuevo, actualizado, obsoleto y restaurado (sección 7.2) |
@@ -659,6 +723,7 @@ Para cada caso se importa el `CLAUDE.md` en una memoria **nueva y en RAM**, con 
 | `espacial` | canal 0 + canal 1 |
 | `espacial + lectura` | canal 0 + canal 1 + canal 2 |
 | `todo` | canales 0–3 en el orden de los hooks (session-start → prompt → un read por archivo), con deduplicación de sesión |
+| `todo + vecinos` | canales 0–3 enriquecidos con vecinos de importación e identificadores del grafo de código |
 
 Métricas por caso y configuración: tokens inyectados (`approx_tokens` del texto renderizado), recall = relevantes inyectadas / relevantes, precisión = relevantes inyectadas / inyectadas, y críticas perdidas.
 
@@ -822,6 +887,31 @@ Revisión por proyecto, a mano (18-10-2026):
 - **Clay-Myrrh**: la única detección, «se te olvidó algo sutil… no añadiste el gitignore ni los workflows», es una corrección real. Se pierde una: un mensaje que solo pega el error del programa recién hecho («Error durante la ejecución: No Windows console found…»). La muestra es muy pequeña (12 mensajes) para dar una tasa.
 - **Claude Code en conjunto**: este repo no tiene todavía un grupo sin memoria con el que comparar.
 
+### 12.9 Medición de la Fase 8b (Enrutado por grafo de código)
+
+En la Fase 8b se añade la configuración `todo + vecinos` a `cthg eval`, que evalúa los canales 0–3 enriquecidos con la expansión a vecinos de importación directos a 1 salto ($W_{\text{vecino}}$) e identificadores exactos del mensaje ($W_{\text{símbolo}}$).
+
+#### Resultados comparativos (con $W_{\text{vecino}} = 0,5$ y $W_{\text{símbolo}} = 0,9$)
+
+| Conjunto | `todo` (sin vecinos) | `todo + vecinos` (8b) | Variación |
+|---|---|---|---|
+| **Ajuste** (`eval/3d-memory`, 17 casos) | 472 tok · 79 % recall · 4 críticas perdidas | 460 tok · 83 % recall · **2 críticas perdidas** | −12 tok · +4 % recall · **−2 críticas perdidas** |
+| **Prueba** (`eval/3d-memory-prueba`, 17 casos) | 435 tok · 81 % recall · 3 críticas perdidas | 444 tok · 85 % recall · **1 crítica perdida** | +9 tok · +4 % recall · **−2 críticas perdidas** |
+| **Ejemplo sintético** (`eval/ejemplo`, 10 casos sin índice) | 167 tok · 93 % recall · 1 crítica perdida | 167 tok · 93 % recall · 1 crítica perdida | Idéntico (0 regresiones) |
+
+#### Desglose de canales (críticas perdidas)
+
+| Conjunto | Base (`todo`) | Solo vecinos (`--w-simbolo 0`) | Solo identificadores (`--w-vecino 0`) | Ambos (`todo + vecinos`) |
+|---|---:|---:|---:|---:|
+| **Ajuste** (`eval/3d-memory`, 17 casos) | 4 | 2 | 3 | 2 |
+| **Prueba** (`eval/3d-memory-prueba`, 17 casos) | 3 | 1 | 1 | 1 |
+
+#### Aportación de cada canal y calibración de pesos
+
+- **La mejora en prueba no viene solo de identificadores**: cada canal por sí solo recupera los dos casos (`decode` y `crc32` llegan a `binary.rs` por identificador y también por importación al estar referenciados en los archivos involucrados).
+- **En ajuste, los vecinos aportan más**: el canal de vecinos por sí solo reduce 2 críticas perdidas (de 4 a 2), mientras que el de identificadores por sí solo reduce 1 (de 4 a 3). Ambos combinados ofrecen la máxima cobertura manteniendo 2 críticas perdidas.
+- **Invarianza en la cuadrícula de pesos**: al barrer $W_{\text{vecino}} \in [0,1, 0,7]$ y $W_{\text{símbolo}} \in [0,1, 0,9]$ con las opciones `--w-vecino` y `--w-simbolo` añadidas a `cthg eval`, las métricas globales de `eval/3d-memory` con ambos canales activos se mantienen constantes (tokens = 460, recall = 83 %, críticas = 2). Al no haber saturación presupuestaria entre reglas del mismo archivo, estos conjuntos no distinguen pesos intermedios. Por ello, $W_{\text{vecino}} = 0,5$ y $W_{\text{símbolo}} = 0,9$ se fijan como **valores de partida**.
+
 ### 12.4 Siguientes mediciones
 
 1. Uno o dos repos reales con un `CLAUDE.md` largo, 15–30 casos de sesiones pasadas, etiquetados a mano.
@@ -843,7 +933,13 @@ Criterio de éxito: ≥ 70 % menos tokens que `completo`, **cero** críticas per
 | 5 | `verify` (anclar y desanclar contra el repo), más arreglos: símbolo del método editado, aviso de núcleo desbordado, renombres solo en el tronco, candado de escritura, `core --unset` | ✅ (27 tests) |
 | 6 | `cthg eval` + conjunto sintético (sección 12); falta medir repos reales | ✅ (32 tests) |
 | 6b | La memoria captura sola las correcciones del usuario, como propuestas que no se inyectan hasta `confirm`: hook `Stop` en Claude Code y Antigravity (sección 6.1) y `cthg corrections` para medirlas (sección 12.8). Formato v3 (flag `PROPOSED`) | ✅ (56 tests) |
-| 7 | Ramas fusionadas visibles en el tronco, `gc`, visor 3D | pendiente |
+| 8a | Grafo del código: escáner Rust, `.cthg/indice.tsv`, `index`, `map`, `where`, `callers` | ✅ (77 tests) |
+| 8b | Enrutado por vecinos e identificadores de código con eval (canal espacial extendido a importadores y dependencias a 1 salto, atribución de vecino, desempate directo) | ✅ (89 tests) |
+| 8c | Escáneres para más lenguajes (Python, JS/TS con JSX/TSX, HTML), firmas en todos los lenguajes, decoradores de Python, índice v2, aislamiento por familias y robustez ante pánicos | ✅ (109 tests) |
+| 8d | Canal pedido: skill y hooks apuntan a `cthg map` para auto-orientación | pendiente |
+| 8e | Visor 3D (`memviz`): proyección del grafo de código junto al hipergrafo de memoria | pendiente |
+| 8f | Base de datos y rutas HTTP: tablas y consultas por función, modelos ORM, decoradores de ruta; diseñarla tras verla en un proyecto real | pendiente |
+| 7 | Ramas fusionadas visibles en el tronco, `gc`, visor 3D | pendiente (la fase 8 va antes que la 7) |
 
 ---
 

@@ -9,7 +9,7 @@ use cthg_core::retrieve::{self, Query};
 use cthg_core::score::{self, certainty_tag, View};
 use cthg_core::spatial::{self, Target};
 use cthg_core::verify::{self, RepoProbe, VerifyAction};
-use cthg_core::{binary, correction, eval, hook, import, text};
+use cthg_core::{binary, correction, eval, hook, import, index, text};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -21,7 +21,11 @@ const FILE: &str = "memoria.cthg";
 const SES_DIR: &str = "sesion";
 /// Paths that change a lot and say nothing about the task.
 const NOISE: &[&str] = &["Cargo.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock"];
-const NOISE_DIRS: &[&str] = &["target/", "node_modules/", "dist/", "build/", ".cthg/"];
+const NOISE_DIRS: &[&str] = &[
+    "target/", "node_modules/", "dist/", "build/", ".cthg/",
+    "__pycache__/", ".venv/", "venv/", "env/", ".next/",
+    "coverage/", ".mypy_cache/", ".pytest_cache/",
+];
 const MAX_GIT_PATHS: usize = 12;
 /// Corrections already learned in this repo, one fingerprint per line: a second `Stop` over the
 /// same transcript, or a resumed session, does not learn them again.
@@ -40,7 +44,11 @@ const HELP: &str = "cthg — memoria de proyecto (ruta · tiempo · confianza)
              [--core] [--plan] [--deny]
   cthg confirm <id>      cthg deny <id>
   cthg core [<id>... [--unset]] [--budget N]
-  cthg recall [--prompt <texto>] [--path P]... [--git] [--budget N] [--limit N]
+  cthg recall [--prompt <texto>] [--path P]... [--git] [--budget N] [--limit N] [--sin-vecinos]
+  cthg index [--rebuild]
+  cthg map [ruta] [--limit N]
+  cthg where <símbolo>
+  cthg callers <símbolo> [--tests]
   cthg list [--all]
   cthg mv <de> <a>       (la memoria sigue a un archivo o carpeta movidos)
   cthg import <archivo.md> [--yes]
@@ -49,7 +57,7 @@ const HELP: &str = "cthg — memoria de proyecto (ruta · tiempo · confianza)
   cthg hook antigravity-stop                         (Google Antigravity, Stop)
   cthg verify [--run-commands]
   cthg <init|learn|confirm|deny|core|list|import> --global   (memoria de todos los proyectos)
-  cthg eval <carpeta> [--markdown] [--repo DIR] [--file CLAUDE.md] [--core-auto]
+  cthg eval <carpeta> [--markdown] [--repo DIR] [--file CLAUDE.md] [--core-auto] [--w-vecino X] [--w-simbolo Y]
   cthg corrections [<transcript.jsonl|carpeta>...] [--desde AAAA-MM-DD] [--detalle]
       (correcciones del usuario por conversación; sin rutas, los transcripts de Antigravity)
 
@@ -74,7 +82,7 @@ struct Args {
     opts: Vec<(String, Option<String>)>,
 }
 
-const FLAGS: &[&str] = &["core", "plan", "deny", "git", "all", "yes", "unset", "run-commands", "markdown", "core-auto", "global", "detalle"];
+const FLAGS: &[&str] = &["core", "plan", "deny", "git", "all", "yes", "unset", "run-commands", "markdown", "core-auto", "global", "detalle", "rebuild", "tests", "sin-vecinos"];
 
 impl Args {
     fn parse(raw: &[String]) -> Result<Self, String> {
@@ -293,12 +301,29 @@ fn render(m: &Memory, scores: &[score::Score], n: &Node) -> String {
 
 /// Lines grouped by χ band, most trusted band first.
 fn print_bands(m: &Memory, scores: &[score::Score], ids: &[u32]) {
+    let empty_map = std::collections::HashMap::new();
+    print_bands_with_neighbors(m, scores, ids, &empty_map);
+}
+
+fn print_bands_with_neighbors(
+    m: &Memory,
+    scores: &[score::Score],
+    ids: &[u32],
+    neighbor_origins: &std::collections::HashMap<u32, String>,
+) {
     let bands = ["verificado", "probable", "sin evidencia", "dudoso", "descartado"];
     for band in bands {
         let lines: Vec<String> = ids
             .iter()
             .filter(|&&id| certainty_tag(scores[id as usize].chi) == band)
-            .map(|&id| render(m, scores, &m.nodes[id as usize]))
+            .map(|&id| {
+                hook::render_node_with_neighbor(
+                    m,
+                    scores,
+                    &m.nodes[id as usize],
+                    neighbor_origins.get(&id).map(String::as_str),
+                )
+            })
             .collect();
         if lines.is_empty() {
             continue;
@@ -319,7 +344,7 @@ fn run(raw: &[String]) -> Result<(), String> {
     let a = Args::parse(rest)?;
     let repo = if a.flag("global") { Repo::global()? } else { Repo::open() };
     if repo.global {
-        if matches!(cmd.as_str(), "recall" | "verify" | "mv" | "eval" | "hook" | "corrections") {
+        if matches!(cmd.as_str(), "recall" | "verify" | "mv" | "eval" | "hook" | "corrections" | "index" | "map" | "where" | "callers") {
             return Err(format!("`{cmd}` no aplica a la memoria global: no tiene rutas ni repo"));
         }
         if a.get("path").is_some() || a.get("symbol").is_some() {
@@ -472,6 +497,19 @@ fn run(raw: &[String]) -> Result<(), String> {
                     }
                 }
             }
+            let index = if a.flag("sin-vecinos") {
+                None
+            } else {
+                load_index_cached(&repo.root)
+            };
+            if let Some(ref idx) = index {
+                let mut all_targets = spatial::expand_neighbors(&targets, Some(idx), spatial::W_NEIGHBOR, spatial::MAX_NEIGHBORS);
+                if let Some(prompt) = a.get("prompt") {
+                    let id_targets = spatial::identifier_targets(prompt, Some(idx), spatial::W_SYMBOL, spatial::MIN_IDENT_LEN, spatial::MAX_DEFS);
+                    spatial::merge_targets(&mut all_targets, id_targets);
+                }
+                targets = all_targets;
+            }
             let scores = score::score_all(&m, &view(&repo, &m));
             let q = Query { text: a.get("prompt").unwrap_or("").to_string(), targets };
             let limit = a.num("limit")?.unwrap_or(40);
@@ -482,10 +520,13 @@ fn run(raw: &[String]) -> Result<(), String> {
                 .map(|r| r.id)
                 .filter(|&id| hook::may_inject(&m.nodes[id as usize], None))
                 .collect();
-            let ids = retrieve::fit_budget(&m, &ids, budget, |n| render(&m, &scores, n));
+            let neighbor_origins = spatial::node_neighbor_origins(&m, &q.targets, &ids);
+            let ids = retrieve::fit_budget(&m, &ids, budget, |n| {
+                hook::render_node_with_neighbor(&m, &scores, n, neighbor_origins.get(&n.id).map(String::as_str))
+            });
             if !ids.is_empty() {
                 println!("## Memoria relevante");
-                print_bands(&m, &scores, &ids);
+                print_bands_with_neighbors(&m, &scores, &ids, &neighbor_origins);
             }
         }
         "list" => {
@@ -688,7 +729,49 @@ fn run(raw: &[String]) -> Result<(), String> {
                 _ => repo_files(&root),
             };
             let resolve = |p: &str| resolve_in(&files, &root, p);
-            let report = eval::run(&name, &md, &file, &resolve, a.flag("core-auto"));
+            let index = if a.get("repo").is_some() {
+                let list_files_fn = || {
+                    if let Some(ref rf) = repo_files(&root) {
+                        rf.files().to_vec()
+                    } else {
+                        let mut out = Vec::new();
+                        walk_dir_rs(&root, "", &mut out);
+                        out
+                    }
+                };
+                let file_meta_fn = |p: &str| {
+                    let meta = fs::metadata(root.join(p)).ok()?;
+                    let size = meta.len();
+                    let mtime = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    Some((size, mtime))
+                };
+                let read_file_bytes_fn = |p: &str| fs::read(root.join(p)).ok();
+                let read_index_fn = || load_index_cached(&root).map(|idx| index::format_index(&idx));
+                let write_index_fn = |_content: &str| Ok(());
+
+                let probe = index::IndexProbe {
+                    list_files: &list_files_fn,
+                    file_meta: &file_meta_fn,
+                    read_file_bytes: &read_file_bytes_fn,
+                    read_index: &read_index_fn,
+                    write_index: &write_index_fn,
+                };
+                index::update_index(&probe, false).ok().map(|(idx, _)| idx)
+            } else {
+                None
+            };
+            let w_vecino = a.num::<f32>("w-vecino")?.unwrap_or(cthg_core::spatial::W_NEIGHBOR);
+            let w_simbolo = a.num::<f32>("w-simbolo")?.unwrap_or(cthg_core::spatial::W_SYMBOL);
+            let weights = eval::EvalWeights {
+                w_neighbor: w_vecino,
+                w_symbol: w_simbolo,
+            };
+            let report = eval::run_with_index_and_weights(&name, &md, &file, &resolve, a.flag("core-auto"), index.as_ref(), weights);
             let out = eval::render_markdown(&report, &dir.display().to_string());
             print!("{out}");
             if a.flag("markdown") {
@@ -715,6 +798,125 @@ escrito: {}", path.display());
                 })
                 .collect();
             print!("{}", correction::report(&stats, a.get("desde"), a.flag("detalle")));
+        }
+        "index" => {
+            let start = Instant::now();
+            let rebuild = a.flag("rebuild");
+            let (_idx, stats) = run_index_update(&repo.root, rebuild)?;
+            let elapsed_ms = start.elapsed().as_millis();
+            println!(
+                "índice: {} archivos ({} reescaneados, {} sin cambios, {} quitados), {} símbolos, {} importaciones resueltas de {}, en {} ms",
+                stats.total_files,
+                stats.rescanned,
+                stats.unchanged,
+                stats.removed,
+                stats.total_symbols,
+                stats.resolved_imports,
+                stats.total_imports,
+                elapsed_ms
+            );
+            if !stats.failed_files.is_empty() {
+                println!(
+                    "{} archivos no se pudieron escanear: {}",
+                    stats.failed_files.len(),
+                    stats.failed_files.join(", ")
+                );
+            }
+        }
+        "where" => {
+            let sym = a.pos.first().ok_or_else(|| "falta el símbolo: `cthg where <símbolo>`".to_string())?;
+            let (idx, _) = run_index_update(&repo.root, false)?;
+            let results = index::where_symbol(&idx, sym);
+            if results.is_empty() {
+                println!("no se encontraron definiciones de '{sym}'");
+            } else {
+                for r in results {
+                    let parent_str = r.parent.as_ref().map(|p| format!(" [{p}]")).unwrap_or_default();
+                    let sig_str = if r.signature.is_empty() {
+                        String::new()
+                    } else if r.signature.starts_with('(') || r.signature.starts_with('<') {
+                        r.signature.clone()
+                    } else {
+                        format!(" {}", r.signature)
+                    };
+                    println!("{}:{} {} {}{}{}", r.path, r.line, r.kind, r.name, sig_str, parent_str);
+                }
+            }
+        }
+        "callers" => {
+            let sym = a.pos.first().ok_or_else(|| "falta el símbolo: `cthg callers <símbolo>`".to_string())?;
+            let (idx, _) = run_index_update(&repo.root, false)?;
+            let res = index::callers(&idx, sym);
+            if res.is_ambiguous {
+                println!(
+                    "aviso: '{sym}' está definido en {} archivos (ambiguo; priorizando llamadas desde importadores)",
+                    res.def_files_count
+                );
+            }
+            let show_tests = a.flag("tests");
+            let normal_callers: Vec<_> = res.callers.iter().filter(|c| !c.is_test).collect();
+            let test_callers: Vec<_> = res.callers.iter().filter(|c| c.is_test).collect();
+
+            if normal_callers.is_empty() && test_callers.is_empty() {
+                println!("no se encontraron llamadas a '{sym}'");
+                return Ok(());
+            }
+
+            for c in normal_callers {
+                if c.from == "(nivel de módulo)" {
+                    println!("{}:{} (nivel de módulo)", c.path, c.line);
+                } else {
+                    println!("{}:{} (dentro de {})", c.path, c.line, c.from);
+                }
+            }
+
+            if show_tests {
+                if !test_callers.is_empty() {
+                    println!("[en tests]");
+                    for c in test_callers {
+                        if c.from == "(nivel de módulo)" {
+                            println!("{}:{} (nivel de módulo)", c.path, c.line);
+                        } else {
+                            println!("{}:{} (dentro de {})", c.path, c.line, c.from);
+                        }
+                    }
+                }
+            } else if !test_callers.is_empty() {
+                println!("({} llamadas en tests, usa --tests para verlas)", test_callers.len());
+            }
+        }
+        "map" => {
+            let (idx, _) = run_index_update(&repo.root, false)?;
+            let raw_target = a.pos.first().map(|s| spatial::normalize(s));
+            let target = raw_target.as_deref().unwrap_or("");
+
+            if let Some(entry) = idx.get_file(target) {
+                print_file_map(&repo, &idx, entry, a.flag("tests"))?;
+            } else if cthg_core::lang::lang_of(target).is_some() && repo.root.join(target).is_file() {
+                return Err(format!("el archivo '{target}' no está en el índice"));
+            } else {
+                let limit = a.num("limit")?.unwrap_or(50);
+                let tree = index::compact_tree(&idx, target, limit);
+                if tree.is_empty() {
+                    if target.is_empty() {
+                        println!("el repositorio no tiene archivos indexados");
+                    } else {
+                        println!("no hay archivos indexados en '{target}'");
+                    }
+                    return Ok(());
+                }
+                for f in &tree {
+                    println!("{} ({} símbolos, {} públicos):", f.path, f.total_symbols, f.public_symbols.len());
+                    for s in &f.public_symbols {
+                        let parent_str = s.parent.as_ref().map(|p| format!(" [{p}]")).unwrap_or_default();
+                        let sig_100 = truncate_sig_map(&s.signature);
+                        println!("  pub {} {}{sig_100} (L{}){}", s.kind, s.name, s.line, parent_str);
+                    }
+                }
+                if tree.len() >= limit {
+                    println!("... (recortado a {limit} archivos, usa --limit N para ver más)");
+                }
+            }
         }
         "gc" | "view" => {
             return Err(format!("`{cmd}` aún no está implementado (ver GUIA.md, sección Fases)"));
@@ -845,10 +1047,13 @@ fn run_antigravity(raw: &str) -> Result<String, String> {
         steps = found;
     }
 
+    let mut index_opt = None;
     if !session.started {
         learn::begin_session(&mut m);
         session.started = true;
+        index_opt = update_index_with_timeout(&repo.root, Duration::from_millis(500));
     }
+    let idx = index_opt.or_else(|| load_index_cached(&repo.root));
     let v = view(&repo, &m);
     let global = load_global();
     let mut parts: Vec<String> = Vec::new();
@@ -862,7 +1067,7 @@ fn run_antigravity(raw: &str) -> Result<String, String> {
     let last_msg = steps.iter().rposition(|s| matches!(s, Step::User { index, .. } | Step::Agent { index, .. } if *index > session.turn));
     if let Some(Step::User { index, text } | Step::Agent { index, text, .. }) = last_msg.map(|i| &steps[i]) {
         let (git_ts, _) = repo.sync_git_and_targets(&mut m);
-        parts.push(hook::handle_prompt(&mut m, &v, &mut session, text, git_ts));
+        parts.push(hook::handle_prompt_with_index(&mut m, &v, &mut session, text, git_ts, idx.as_ref()));
         session.turn = *index;
     }
     // Files read or written in this turn (edits before its message still refresh activation).
@@ -876,11 +1081,11 @@ fn run_antigravity(raw: &str) -> Result<String, String> {
         match step {
             Step::Read(path) => {
                 let rel = hook::relativize_path(&repo.root, path);
-                parts.push(hook::read_context(&mut m, &v, &mut session, &rel));
+                parts.push(hook::read_context_with_index(&mut m, &v, &mut session, &rel, idx.as_ref()));
             }
             Step::Edit(path) => {
                 let rel = hook::relativize_path(&repo.root, path);
-                parts.push(hook::edit_context(&mut m, &v, &mut session, &rel));
+                parts.push(hook::edit_context_with_index(&mut m, &v, &mut session, &rel, idx.as_ref()));
             }
             _ => {}
         }
@@ -936,6 +1141,7 @@ fn run_hook(rest: &[String]) -> Result<(), String> {
 
     match event {
         "session-start" => {
+            let _ = update_index_with_timeout(&repo.root, Duration::from_millis(500));
             let mut session = hook::SessionState::new(&input.session_id);
             session.native = native();
             let v = view(&repo, &m);
@@ -948,11 +1154,12 @@ fn run_hook(rest: &[String]) -> Result<(), String> {
             }
         }
         "prompt" => {
+            let idx = load_index_cached(&repo.root);
             let mut session = hook::SessionState::load(&ses_dir, &input.session_id);
             session.native = native();
             let (git_ts, moved) = repo.sync_git_and_targets(&mut m);
             let v = view(&repo, &m);
-            let out = hook::handle_prompt(&mut m, &v, &mut session, &input.prompt, git_ts);
+            let out = hook::handle_prompt_with_index(&mut m, &v, &mut session, &input.prompt, git_ts, idx.as_ref());
             if !out.is_empty() || moved > 0 {
                 save(&m);
             }
@@ -962,11 +1169,12 @@ fn run_hook(rest: &[String]) -> Result<(), String> {
             }
         }
         "read" => {
+            let idx = load_index_cached(&repo.root);
             let rel = hook::relativize_path(&repo.root, &input.file_path);
             let mut session = hook::SessionState::load(&ses_dir, &input.session_id);
             session.native = native();
             let v = view(&repo, &m);
-            let out = hook::handle_read(&mut m, &v, &mut session, &rel);
+            let out = hook::handle_read_with_index(&mut m, &v, &mut session, &rel, idx.as_ref());
             if !out.is_empty() {
                 let _ = session.save(&ses_dir);
                 save(&m);
@@ -974,12 +1182,13 @@ fn run_hook(rest: &[String]) -> Result<(), String> {
             }
         }
         "edit" => {
+            let idx = load_index_cached(&repo.root);
             let rel = hook::relativize_path(&repo.root, &input.file_path);
             let mut session = hook::SessionState::load(&ses_dir, &input.session_id);
             session.native = native();
             let v = view(&repo, &m);
             let before = m.nodes.iter().filter(|n| n.activation == 1.0).count();
-            let context = hook::edit_context(&mut m, &v, &mut session, &rel);
+            let context = hook::edit_context_with_index(&mut m, &v, &mut session, &rel, idx.as_ref());
             let after = m.nodes.iter().filter(|n| n.activation == 1.0).count();
             if !context.is_empty() || after != before || !rel.is_empty() {
                 save(&m);
@@ -1095,6 +1304,235 @@ fn conversation_name(f: &Path) -> String {
     name.and_then(|n| n.to_str()).unwrap_or("?").chars().take(8).collect()
 }
 
+fn truncate_sig_map(sig: &str) -> String {
+    if sig.is_empty() {
+        String::new()
+    } else {
+        let mut s = if sig.starts_with('(') || sig.starts_with('<') {
+            sig.to_string()
+        } else {
+            format!(" {sig}")
+        };
+        if s.chars().count() > 100 {
+            s = format!("{}…", s.chars().take(99).collect::<String>().trim_end());
+        }
+        s
+    }
+}
+
+fn print_file_map(
+    repo: &Repo,
+    idx: &index::ProjectIndex,
+    entry: &index::FileEntry,
+    show_tests: bool,
+) -> Result<(), String> {
+    println!("{}:", entry.path);
+
+    let test_count = entry.symbols.iter().filter(|s| s.test).count();
+
+    // Separate primary symbols (functions, classes, constants) from module variables
+    let non_var_syms: Vec<_> = entry
+        .symbols
+        .iter()
+        .filter(|s| s.kind != "var" && (show_tests || !s.test))
+        .collect();
+    let var_syms: Vec<_> = entry
+        .symbols
+        .iter()
+        .filter(|s| s.kind == "var" && (show_tests || !s.test))
+        .collect();
+
+    let public_syms: Vec<_> = non_var_syms.iter().copied().filter(|s| s.public).collect();
+    let private_syms: Vec<_> = non_var_syms.iter().copied().filter(|s| !s.public).collect();
+
+    for s in public_syms {
+        let parent_str = s.parent.as_ref().map(|p| format!(" [{p}]")).unwrap_or_default();
+        let sig_100 = truncate_sig_map(&s.signature);
+        println!("  pub {} {}{sig_100} (L{}-L{}){}", s.kind, s.name, s.line, s.end_line, parent_str);
+    }
+    for s in private_syms {
+        let parent_str = s.parent.as_ref().map(|p| format!(" [{p}]")).unwrap_or_default();
+        let sig_100 = truncate_sig_map(&s.signature);
+        println!("  {} {}{sig_100} (L{}-L{}){}", s.kind, s.name, s.line, s.end_line, parent_str);
+    }
+
+    if !var_syms.is_empty() {
+        if var_syms.len() > 10 && !show_tests {
+            println!("  {} variables de módulo (usa --tests para verlas)", var_syms.len());
+        } else {
+            for s in &var_syms {
+                let pub_prefix = if s.public { "pub " } else { "" };
+                let parent_str = s.parent.as_ref().map(|p| format!(" [{p}]")).unwrap_or_default();
+                let sig_100 = truncate_sig_map(&s.signature);
+                println!("  {pub_prefix}{} {}{sig_100} (L{}-L{}){}", s.kind, s.name, s.line, s.end_line, parent_str);
+            }
+        }
+    }
+
+    if test_count > 0 && !show_tests {
+        println!("  {test_count} tests (usa --tests para verlos)");
+    }
+
+    let (imports, imported_by) = index::file_neighbors(idx, &entry.path);
+    println!("importa:");
+    if imports.is_empty() {
+        println!("  (ninguna)");
+    } else {
+        for imp in &imports {
+            println!("  {imp}");
+        }
+    }
+
+    println!("importado por:");
+    if imported_by.is_empty() {
+        println!("  (nadie)");
+    } else {
+        for imp_by in &imported_by {
+            println!("  {imp_by}");
+        }
+    }
+
+    if repo.file.exists() {
+        let m = repo.load()?;
+        let scores = score::score_all(&m, &view(repo, &m));
+
+        let direct_rules = index::anchored_rules_for_file(&m, &scores, &entry.path);
+        if !direct_rules.is_empty() {
+            println!("reglas:");
+            for id in direct_rules {
+                let n = &m.nodes[id as usize];
+                println!("  {}", hook::render_node(&m, &scores, n));
+            }
+        }
+
+        let mut all_neighbors = imports;
+        all_neighbors.extend(imported_by);
+        let direct_all = index::anchored_rules_for_file(&m, &scores, &entry.path);
+        let neighbor_rules = index::neighbor_rules_for_file(&m, &scores, &all_neighbors, &direct_all);
+        if !neighbor_rules.is_empty() {
+            println!("en vecinos:");
+            for id in neighbor_rules {
+                let n = &m.nodes[id as usize];
+                println!("  {}", hook::render_node(&m, &scores, n));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn walk_dir_rs(root: &Path, rel: &str, out: &mut Vec<String>) {
+    let dir = if rel.is_empty() { root.to_path_buf() } else { root.join(rel) };
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let child_rel = if rel.is_empty() {
+            name_str.into_owned()
+        } else {
+            format!("{rel}/{name_str}")
+        };
+        let norm = spatial::normalize(&child_rel);
+        if NOISE_DIRS.iter().any(|d| norm.starts_with(d) || norm.contains(d)) {
+            continue;
+        }
+        if let Ok(ft) = entry.file_type() {
+            if ft.is_dir() {
+                walk_dir_rs(root, &norm, out);
+            } else if ft.is_file() && cthg_core::lang::lang_of(&norm).is_some() {
+                out.push(norm);
+            }
+        }
+    }
+}
+
+fn load_index_cached(root: &Path) -> Option<index::ProjectIndex> {
+    let p = root.join(DIR).join("indice.tsv");
+    let content = fs::read_to_string(p).ok()?;
+    index::parse_index(&content).ok()
+}
+
+fn update_index_with_timeout(root: &Path, timeout: Duration) -> Option<index::ProjectIndex> {
+    let root_buf = root.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = std::thread::spawn(move || {
+        let res = run_index_update(&root_buf, false);
+        let _ = tx.send(res);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok((idx, _))) => Some(idx),
+        _ => load_index_cached(root),
+    }
+}
+
+fn run_index_update(root: &Path, rebuild: bool) -> Result<(index::ProjectIndex, index::IndexStats), String> {
+    let list_files_fn = || {
+        if let Some(rf) = repo_files(root) {
+            rf.files().to_vec()
+        } else {
+            let mut out = Vec::new();
+            walk_dir_rs(root, "", &mut out);
+            out
+        }
+    };
+    let file_meta_fn = |p: &str| {
+        let meta = fs::metadata(root.join(p)).ok()?;
+        let size = meta.len();
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Some((size, mtime))
+    };
+    let read_file_bytes_fn = |p: &str| fs::read(root.join(p)).ok();
+    let read_index_fn = || fs::read_to_string(root.join(DIR).join("indice.tsv")).ok();
+    let write_index_fn = |content: &str| {
+        let dir = root.join(DIR);
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+        let gi = dir.join(".gitignore");
+        if gi.exists() {
+            if let Ok(existing) = fs::read_to_string(&gi) {
+                if !existing.lines().any(|l| l.trim() == "indice.tsv" || l.trim() == "indice.tsv*") {
+                    let mut updated = existing;
+                    if !updated.ends_with('\n') {
+                        updated.push('\n');
+                    }
+                    updated.push_str("indice.tsv\n");
+                    let _ = fs::write(&gi, updated);
+                }
+            }
+        } else {
+            let _ = fs::write(&gi, "indice.tsv\n");
+        }
+
+        let pid = std::process::id();
+        let tmp_path = dir.join(format!("indice.tsv.{pid}.tmp"));
+        let final_path = dir.join("indice.tsv");
+        fs::write(&tmp_path, content).map_err(|e| format!("no se pudo escribir temporal de índice: {e}"))?;
+        if let Err(e) = fs::rename(&tmp_path, &final_path) {
+            let _ = fs::remove_file(&final_path);
+            if let Err(e2) = fs::rename(&tmp_path, &final_path) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(format!("no se pudo renombrar temporal de índice: {e2} (anterior: {e})"));
+            }
+        }
+        Ok(())
+    };
+
+    let probe = index::IndexProbe {
+        list_files: &list_files_fn,
+        file_meta: &file_meta_fn,
+        read_file_bytes: &read_file_bytes_fn,
+        read_index: &read_index_fn,
+        write_index: &write_index_fn,
+    };
+
+    index::update_index(&probe, rebuild)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1186,4 +1624,64 @@ mod tests {
 
         let _ = fs::remove_dir_all(&base);
     }
+
+    #[test]
+    fn recall_with_neighbors_and_sin_vecinos_flag() {
+        let base = std::env::temp_dir().join(format!("cthg-recall-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join(DIR)).unwrap();
+
+        let mut m = Memory::default();
+        let mut cli_rule = Claim::rule("En src/cli.rs los codigos de salida son 2", "src/cli.rs");
+        cli_rule.origin = Origin::Imported;
+        learn::learn(&mut m, &cli_rule, 100.0);
+        binary::save(&m, &base.join(DIR).join(FILE)).unwrap();
+
+        // Create indice.tsv where src/main.rs imports src/cli.rs
+        let mut index = index::ProjectIndex::default();
+        index.files.push(index::FileEntry {
+            path: "src/main.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 10,
+            mtime: 1,
+            hash: 1,
+                    status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![cthg_core::lang_rust::Import {
+                raw: "use crate::cli;".to_string(),
+                resolved: Some("src/cli.rs".to_string()),
+            }],
+            calls: vec![],
+        });
+        index.files.push(index::FileEntry {
+            path: "src/cli.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 10,
+            mtime: 1,
+            hash: 2,
+                    status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![],
+            calls: vec![],
+        });
+        let index_content = index::format_index(&index);
+        fs::write(base.join(DIR).join("indice.tsv"), index_content).unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&base).unwrap();
+
+        let repo = Repo::open();
+        let idx = load_index_cached(&repo.root);
+        assert!(idx.is_some());
+        let targets = vec![Target::new("src/main.rs", 1.0)];
+        let expanded = spatial::expand_neighbors(&targets, idx.as_ref(), spatial::W_NEIGHBOR, spatial::MAX_NEIGHBORS);
+        assert!(expanded.iter().any(|t| t.path == "src/cli.rs"));
+
+        let origins = spatial::node_neighbor_origins(&m, &expanded, &[0]);
+        assert_eq!(origins.get(&0).map(String::as_str), Some("src/main.rs"));
+
+        std::env::set_current_dir(prev).unwrap();
+        let _ = fs::remove_dir_all(&base);
+    }
 }
+

@@ -272,6 +272,10 @@ impl RepoFiles {
             _ => None,
         }
     }
+
+    pub fn files(&self) -> &[String] {
+        &self.files
+    }
 }
 
 /// Imports a Markdown document into `m` using `"CLAUDE.md"` as the default source filename for `node.key`.

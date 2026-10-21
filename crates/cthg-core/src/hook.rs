@@ -10,7 +10,9 @@
 //!   (`S ≤ WHOLE_MAX`) is injected whole at session start.
 //! - `PostToolUse` (`read` and `edit`) wraps injected context in `hookSpecificOutput.additionalContext` JSON.
 
+use super::index::ProjectIndex;
 use super::learn;
+use std::collections::HashMap;
 use super::model::*;
 use super::retrieve::{self, Query};
 use super::score::{self, certainty_tag, Score, View};
@@ -277,13 +279,22 @@ pub fn format_post_tool_use(additional_context: &str) -> String {
     )
 }
 
-/// Renders one memory node line: `- #id tipo (ruta::simbolo): texto ← causa`.
-pub fn render_node(m: &Memory, scores: &[Score], n: &Node) -> String {
+/// Renders one memory node line with optional neighbor origin: `- #id tipo (ruta, vecino de origen): texto ← causa`.
+pub fn render_node_with_neighbor(
+    m: &Memory,
+    scores: &[Score],
+    n: &Node,
+    neighbor_of: Option<&str>,
+) -> String {
     let mut s = format!("- #{} {}", n.id, n.kind.name());
     if !n.path.is_empty() {
-        s.push_str(&format!(" ({}", n.path));
+        s.push_str(" (");
+        s.push_str(&n.path);
         if !n.symbol.is_empty() {
             s.push_str(&format!("::{}", n.symbol));
+        }
+        if let Some(origin) = neighbor_of {
+            s.push_str(&format!(", vecino de {origin}"));
         }
         s.push(')');
     }
@@ -292,12 +303,22 @@ pub fn render_node(m: &Memory, scores: &[Score], n: &Node) -> String {
         .edges
         .iter()
         .filter(|e| e.kind == EdgeKind::Causes && e.to == n.id && scores[e.from as usize].visible)
-        .max_by(|a, b| scores[a.from as usize].chi.partial_cmp(&scores[b.from as usize].chi).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|a, b| {
+            scores[a.from as usize]
+                .chi
+                .partial_cmp(&scores[b.from as usize].chi)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .map(|e| &m.nodes[e.from as usize]);
     if let Some(c) = cause {
         s.push_str(&format!(" ← {}", text::clip(&c.label, 80)));
     }
     s
+}
+
+/// Renders one memory node line: `- #id tipo (ruta::simbolo): texto ← causa`.
+pub fn render_node(m: &Memory, scores: &[Score], n: &Node) -> String {
+    render_node_with_neighbor(m, scores, n, None)
 }
 
 /// What a node shows when injected. Imported text carries its section as `[Sección › Introducción] …`
@@ -313,8 +334,14 @@ pub fn injected_text(n: &Node) -> &str {
 /// Below this length a rule needs its section to be understood.
 const SELF_CONTAINED_CHARS: usize = 40;
 
-/// Formats `ids` grouped by χ certainty band under `heading`.
-pub fn format_bands(heading: &str, m: &Memory, scores: &[Score], ids: &[u32]) -> String {
+/// Formats `ids` grouped by χ certainty band under `heading`, rendering neighbor indicators if present.
+pub fn format_bands_with_neighbors(
+    heading: &str,
+    m: &Memory,
+    scores: &[Score],
+    ids: &[u32],
+    neighbor_map: &HashMap<u32, String>,
+) -> String {
     if ids.is_empty() {
         return String::new();
     }
@@ -324,7 +351,10 @@ pub fn format_bands(heading: &str, m: &Memory, scores: &[Score], ids: &[u32]) ->
         let lines: Vec<String> = ids
             .iter()
             .filter(|&&id| certainty_tag(scores[id as usize].chi) == band)
-            .map(|&id| render_node(m, scores, &m.nodes[id as usize]))
+            .map(|&id| {
+                let neighbor_of = neighbor_map.get(&id).map(String::as_str);
+                render_node_with_neighbor(m, scores, &m.nodes[id as usize], neighbor_of)
+            })
             .collect();
         if lines.is_empty() {
             continue;
@@ -337,6 +367,11 @@ pub fn format_bands(heading: &str, m: &Memory, scores: &[Score], ids: &[u32]) ->
         }
     }
     out
+}
+
+/// Formats `ids` grouped by χ certainty band under `heading`.
+pub fn format_bands(heading: &str, m: &Memory, scores: &[Score], ids: &[u32]) -> String {
+    format_bands_with_neighbors(heading, m, scores, ids, &HashMap::new())
 }
 
 /// Runs `session-start`: one forgetting step, then injects `CORE` nodes within `Budgets::core`.
@@ -437,17 +472,48 @@ pub fn core_context(m: &mut Memory, view: &View, session: &mut SessionState, glo
     }
 }
 
-/// Runs `prompt`: fuses lexical and `git status`/`git diff` spatial channels within the
-/// message's budget (`Budgets::for_prompt`) and what is left of the conversation's.
-pub fn handle_prompt(
+/// Runs `prompt` with optional code index: fuses lexical, git spatial, neighbor expansion,
+/// and message identifier matching within `Budgets::for_prompt`.
+pub fn handle_prompt_with_index(
     m: &mut Memory,
     view: &View,
     session: &mut SessionState,
     prompt: &str,
     git_targets: Vec<Target>,
+    index: Option<&ProjectIndex>,
+) -> String {
+    handle_prompt_with_weights(
+        m,
+        view,
+        session,
+        prompt,
+        git_targets,
+        index,
+        spatial::W_NEIGHBOR,
+        spatial::W_SYMBOL,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn handle_prompt_with_weights(
+    m: &mut Memory,
+    view: &View,
+    session: &mut SessionState,
+    prompt: &str,
+    git_targets: Vec<Target>,
+    index: Option<&ProjectIndex>,
+    w_neighbor: f32,
+    w_symbol: f32,
 ) -> String {
     let scores = score::score_all(m, view);
-    let q = Query { text: prompt.to_string(), targets: git_targets };
+    let mut all_targets = spatial::expand_neighbors(&git_targets, index, w_neighbor, spatial::MAX_NEIGHBORS);
+    let id_targets = spatial::identifier_targets(prompt, index, w_symbol, spatial::MIN_IDENT_LEN, spatial::MAX_DEFS);
+    spatial::merge_targets(&mut all_targets, id_targets);
+
+    let q = Query {
+        text: prompt.to_string(),
+        targets: all_targets.clone(),
+    };
     let candidates: Vec<u32> = retrieve::recall(m, &scores, &q, 40, -1.0)
         .into_iter()
         .map(|r| r.id)
@@ -462,30 +528,65 @@ pub fn handle_prompt(
     session.spent += tokens_of(m, &scores, &ids) as u64;
     session.record(&ids);
     learn::co_recalled(m, &ids);
-    format_bands("## Memoria relevante", m, &scores, &ids)
+    let neighbor_map = spatial::node_neighbor_origins(m, &all_targets, &ids);
+    format_bands_with_neighbors("## Memoria relevante", m, &scores, &ids, &neighbor_map)
 }
 
-/// Runs `read`: just-in-time spatial recall for `rel_path` within `Budgets::read`, wrapped in
-/// `PostToolUse` `hookSpecificOutput.additionalContext` JSON.
-pub fn handle_read(m: &mut Memory, view: &View, session: &mut SessionState, rel_path: &str) -> String {
-    let context = read_context(m, view, session, rel_path);
+/// Runs `prompt`: fuses lexical and `git status`/`git diff` spatial channels within the
+/// message's budget (`Budgets::for_prompt`) and what is left of the conversation's.
+pub fn handle_prompt(
+    m: &mut Memory,
+    view: &View,
+    session: &mut SessionState,
+    prompt: &str,
+    git_targets: Vec<Target>,
+) -> String {
+    handle_prompt_with_index(m, view, session, prompt, git_targets, None)
+}
+
+/// Runs `read` with optional code index: just-in-time spatial recall for `rel_path` and its neighbors.
+pub fn handle_read_with_index(
+    m: &mut Memory,
+    view: &View,
+    session: &mut SessionState,
+    rel_path: &str,
+    index: Option<&ProjectIndex>,
+) -> String {
+    let context = read_context_with_index(m, view, session, rel_path, index);
     if context.is_empty() {
         return context;
     }
     format_post_tool_use(&context)
 }
 
+/// Runs `read`: just-in-time spatial recall for `rel_path` within `Budgets::read`, wrapped in
+/// `PostToolUse` `hookSpecificOutput.additionalContext` JSON.
+pub fn handle_read(m: &mut Memory, view: &View, session: &mut SessionState, rel_path: &str) -> String {
+    handle_read_with_index(m, view, session, rel_path, None)
+}
+
 /// Shared just-in-time spatial recall for a file just read or written (`Budgets::read`, per-session
-/// deduplication, proposals allowed for that file).
-fn file_context(m: &mut Memory, view: &View, session: &mut SessionState, rel_path: &str, suffix: &str) -> String {
+/// deduplication, proposals allowed for that file, optional neighbor expansion).
+fn file_context_with_weights(
+    m: &mut Memory,
+    view: &View,
+    session: &mut SessionState,
+    rel_path: &str,
+    suffix: &str,
+    index: Option<&ProjectIndex>,
+    w_neighbor: f32,
+) -> String {
     let rel_path = spatial::normalize(rel_path);
     if rel_path.is_empty() {
         return String::new();
     }
     let scores = score::score_all(m, view);
+    let base_targets = vec![Target::new(&rel_path, 1.0)];
+    let targets = spatial::expand_neighbors(&base_targets, index, w_neighbor, spatial::MAX_NEIGHBORS);
+
     let q = Query {
         text: String::new(),
-        targets: vec![Target::new(&rel_path, 1.0)],
+        targets: targets.clone(),
     };
     let candidates: Vec<u32> = retrieve::recall(m, &scores, &q, 40, -1.0)
         .into_iter()
@@ -501,20 +602,65 @@ fn file_context(m: &mut Memory, view: &View, session: &mut SessionState, rel_pat
     session.spent += tokens_of(m, &scores, &ids) as u64;
     session.record(&ids);
     learn::co_recalled(m, &ids);
+    let neighbor_map = spatial::node_neighbor_origins(m, &targets, &ids);
     let heading = format!("## Memoria relevante ({rel_path}{suffix})");
-    format_bands(&heading, m, &scores, &ids)
+    format_bands_with_neighbors(&heading, m, &scores, &ids, &neighbor_map)
+}
+
+fn file_context_with_index(
+    m: &mut Memory,
+    view: &View,
+    session: &mut SessionState,
+    rel_path: &str,
+    suffix: &str,
+    index: Option<&ProjectIndex>,
+) -> String {
+    file_context_with_weights(m, view, session, rel_path, suffix, index, spatial::W_NEIGHBOR)
+}
+
+pub fn read_context_with_weights(
+    m: &mut Memory,
+    view: &View,
+    session: &mut SessionState,
+    rel_path: &str,
+    index: Option<&ProjectIndex>,
+    w_neighbor: f32,
+) -> String {
+    file_context_with_weights(m, view, session, rel_path, "", index, w_neighbor)
+}
+
+/// Reads plain context with optional code index for neighbor expansion.
+pub fn read_context_with_index(
+    m: &mut Memory,
+    view: &View,
+    session: &mut SessionState,
+    rel_path: &str,
+    index: Option<&ProjectIndex>,
+) -> String {
+    file_context_with_index(m, view, session, rel_path, "", index)
 }
 
 /// The plain context `read` injects (what `handle_read` wraps in JSON); `eval` counts its tokens.
 pub fn read_context(m: &mut Memory, view: &View, session: &mut SessionState, rel_path: &str) -> String {
-    file_context(m, view, session, rel_path, "")
+    read_context_with_index(m, view, session, rel_path, None)
+}
+
+/// Edits plain context with optional code index for neighbor expansion.
+pub fn edit_context_with_index(
+    m: &mut Memory,
+    view: &View,
+    session: &mut SessionState,
+    rel_path: &str,
+    index: Option<&ProjectIndex>,
+) -> String {
+    handle_edit(m, rel_path);
+    file_context_with_index(m, view, session, rel_path, ", que acabas de escribir", index)
 }
 
 /// Boosts activation for `rel_path` (`handle_edit`) and injects any of that file's rules not yet
 /// injected in this session, with the same `read` budget, deduplication and proposal rules.
 pub fn edit_context(m: &mut Memory, view: &View, session: &mut SessionState, rel_path: &str) -> String {
-    handle_edit(m, rel_path);
-    file_context(m, view, session, rel_path, ", que acabas de escribir")
+    edit_context_with_index(m, view, session, rel_path, None)
 }
 
 /// Runs `edit`: boosts activation on nodes anchored at `rel_path` or its ancestor directories.
@@ -818,6 +964,131 @@ mod tests {
         assert!(total > 0);
         let encoded = session.encode();
         assert_eq!(SessionState::decode(&encoded).unwrap().spent, session.spent);
+    }
+
+    #[test]
+    fn test_proposal_in_neighbor_not_injected() {
+        use crate::index::{FileEntry, ProjectIndex};
+        use crate::lang_rust::Import;
+
+        let mut m = Memory::default();
+        let view = View::all();
+        let mut session = SessionState::new("test");
+
+        // Proposed rule anchored at src/cli.rs
+        m.add_node(Node {
+            id: 0,
+            kind: NodeKind::Rule,
+            origin: Origin::User,
+            flags: flags::PROPOSED,
+            path: "src/cli.rs".to_string(),
+            symbol: String::new(),
+            branch: String::new(),
+            commit: String::new(),
+            y: 1.0,
+            alpha: 4.0,
+            beta: 1.0,
+            activation: 0.0,
+            recalls: 0,
+            created_session: 0,
+            key: String::new(),
+            label: "proposed cli rule".to_string(),
+            text: "rule text".to_string(),
+            aliases: vec![],
+        });
+
+        // Index where src/main.rs imports src/cli.rs
+        let mut idx = ProjectIndex::default();
+        idx.files.push(FileEntry {
+            path: "src/main.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 10,
+            mtime: 10,
+            hash: 1,
+                    status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![Import { raw: "use cli;".to_string(), resolved: Some("src/cli.rs".to_string()) }],
+            calls: vec![],
+        });
+        idx.files.push(FileEntry {
+            path: "src/cli.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 10,
+            mtime: 10,
+            hash: 2,
+                    status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![],
+            calls: vec![],
+        });
+
+        // Reading src/main.rs: neighbor is src/cli.rs, but proposal must NEVER be injected!
+        let out = read_context_with_index(&mut m, &view, &mut session, "src/main.rs", Some(&idx));
+        assert!(out.is_empty(), "proposal in neighbor must not be unlocked by reading main.rs");
+    }
+
+    #[test]
+    fn test_injected_line_carries_neighbor_of_and_without_index_is_same() {
+        use crate::index::{FileEntry, ProjectIndex};
+        use crate::lang_rust::Import;
+
+        let mut m = Memory::default();
+        let view = View::all();
+        let mut session1 = SessionState::new("test1");
+        let mut session2 = SessionState::new("test2");
+
+        m.add_node(Node {
+            id: 0,
+            kind: NodeKind::Rule,
+            origin: Origin::User,
+            flags: 0,
+            path: "src/cli.rs".to_string(),
+            symbol: String::new(),
+            branch: String::new(),
+            commit: String::new(),
+            y: 1.0,
+            alpha: 4.0,
+            beta: 1.0,
+            activation: 0.0,
+            recalls: 0,
+            created_session: 0,
+            key: String::new(),
+            label: "cli rule".to_string(),
+            text: "En src/cli.rs los errores salen con 2".to_string(),
+            aliases: vec![],
+        });
+
+        let mut idx = ProjectIndex::default();
+        idx.files.push(FileEntry {
+            path: "src/main.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 10,
+            mtime: 10,
+            hash: 1,
+                    status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![Import { raw: "use cli;".to_string(), resolved: Some("src/cli.rs".to_string()) }],
+            calls: vec![],
+        });
+        idx.files.push(FileEntry {
+            path: "src/cli.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 10,
+            mtime: 10,
+            hash: 2,
+                    status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![],
+            calls: vec![],
+        });
+
+        // 1. Without index: reading src/main.rs brings nothing for cli.rs
+        let out_no_idx = read_context_with_index(&mut m, &view, &mut session1, "src/main.rs", None);
+        assert!(out_no_idx.is_empty());
+
+        // 2. With index: reading src/main.rs brings the neighbor rule and carries "vecino de"
+        let out_with_idx = read_context_with_index(&mut m, &view, &mut session2, "src/main.rs", Some(&idx));
+        assert!(out_with_idx.contains("vecino de src/main.rs"), "line carries 'vecino de src/main.rs'");
     }
 
     #[test]

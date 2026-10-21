@@ -61,3 +61,44 @@ relevantes: L56!, L57, L67!
 prompt: reescribe retrieve.rs para que quede más limpio
 lee: crates/cthg-core/src/retrieve.rs
 relevantes: L16!, L27!, L34, L64!
+
+## caso: campo nuevo en Memory
+prompt: añade un campo revision a la estructura Memory
+git: crates/cthg-core/src/model.rs
+lee: crates/cthg-core/src/model.rs
+relevantes: L16!, L27!, L35!
+
+## caso: identificador decode en el mensaje
+prompt: la función decode falla con datos truncados
+lee: crates/cthg-core/src/lib.rs
+relevantes: L16!, L27!, L35!
+
+## caso: guardar desde el CLI
+prompt: añade el comando dump para serializar la memoria a stdout
+git: crates/cthg-cli/src/main.rs
+lee: crates/cthg-cli/src/main.rs
+relevantes: L16!, L27!, L31!, L35!
+
+## caso: identificador crc32 en index
+prompt: optimiza crc32 para acelerar el escaneo incremental
+git: crates/cthg-core/src/index.rs
+lee: crates/cthg-core/src/index.rs
+relevantes: L16!, L27!, L35!
+
+## caso: plantilla de hooks desde README
+prompt: actualiza la plantilla de configuración de hooks para Claude Code
+git: hooks/README.md
+lee: hooks/README.md
+relevantes: L16!, L27!, L56!, L57
+
+## caso: cambio en texto sin vecinos relevantes
+prompt: añade la función levenshtein en text.rs
+git: crates/cthg-core/src/text.rs
+lee: crates/cthg-core/src/text.rs
+relevantes: L16!, L22, L27!, L32
+
+## caso: cambio en learn sin relación con binary ni hooks
+prompt: ajusta el decaimiento de activación en learn
+git: crates/cthg-core/src/learn.rs
+lee: crates/cthg-core/src/learn.rs
+relevantes: L16!, L22, L27!, L34!

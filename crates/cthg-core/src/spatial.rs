@@ -10,10 +10,23 @@
 //! - An anchor that is not the target or one of its ancestors: 0. An empty anchor (the root) is
 //!   not spatial at all: cross-cutting rules must be `CORE`.
 
+use std::collections::HashMap;
+use super::index::ProjectIndex;
 use super::model::Memory;
 
 pub const LAMBDA: f32 = 0.8;
 pub const OTHER_SYMBOL: f32 = 0.5;
+
+/// Weight multiplier for neighbor files (1-hop import or importer).
+pub const W_NEIGHBOR: f32 = 0.5;
+/// Weight multiplier for files identified by an exact symbol name in the prompt.
+pub const W_SYMBOL: f32 = 0.9;
+/// Maximum number of neighbors expanded per spatial target.
+pub const MAX_NEIGHBORS: usize = 6;
+/// Minimum identifier length in messages to consider for symbol targeting.
+pub const MIN_IDENT_LEN: usize = 4;
+/// Maximum number of distinct files defining a symbol before it is considered ambiguous.
+pub const MAX_DEFS: usize = 3;
 
 /// A path being worked on, and how sure we are that it matters now.
 #[derive(Clone, Debug, PartialEq)]
@@ -25,11 +38,19 @@ pub struct Target {
     pub weight: f32,
     /// Changed lines (`deleted + added`) from `git diff`, used to rank dirty worktrees.
     pub diff_lines: usize,
+    /// If this target was pulled in as a neighbor, the path of the direct target it connects to.
+    pub neighbor_of: Option<String>,
 }
 
 impl Target {
     pub fn new(path: &str, weight: f32) -> Self {
-        Target { path: normalize(path), symbols: vec![], weight, diff_lines: 0 }
+        Target {
+            path: normalize(path),
+            symbols: vec![],
+            weight,
+            diff_lines: 0,
+            neighbor_of: None,
+        }
     }
 }
 
@@ -103,6 +124,7 @@ pub fn seeds(m: &Memory, targets: &[Target]) -> Vec<f32> {
         .map(|n| {
             targets
                 .iter()
+                .filter(|t| t.weight > 0.0)
                 .map(|t| t.weight * affinity(&n.path, &n.symbol, t))
                 .fold(0.0f32, f32::max)
         })
@@ -429,12 +451,12 @@ pub fn rank_git_targets(
             .find(|d| d.path == path)
             .map(|d| (d.symbols.clone(), d.lines))
             .unwrap_or_default();
-        targets.push(Target { path, symbols, weight, diff_lines });
+        targets.push(Target { path, symbols, weight, diff_lines, neighbor_of: None });
     }
 
     for d in diffs {
         if !d.path.is_empty() && !is_noise(&d.path) && !targets.iter().any(|t| t.path == d.path) {
-            targets.push(Target { path: d.path, symbols: d.symbols, weight: 0.8, diff_lines: d.lines });
+            targets.push(Target { path: d.path, symbols: d.symbols, weight: 0.8, diff_lines: d.lines, neighbor_of: None });
         }
     }
 
@@ -448,8 +470,622 @@ pub fn rank_git_targets(
     targets
 }
 
+
+/// Expands `targets` by adding 1-hop neighbor files from `index`, weighted by `w_neighbor * target.weight`.
+/// Direct targets win over neighbors and keep `neighbor_of = None`. Neighbors are not expanded recursively.
+pub fn expand_neighbors(
+    targets: &[Target],
+    index: Option<&ProjectIndex>,
+    w_neighbor: f32,
+    max_neighbors: usize,
+) -> Vec<Target> {
+    let mut out: Vec<Target> = targets.iter().filter(|t| t.weight > 0.0).cloned().collect();
+    if w_neighbor <= 0.0 {
+        return out;
+    }
+    let idx = match index {
+        Some(i) => i,
+        None => return out,
+    };
+
+    for target in targets {
+        if target.weight <= 0.0 {
+            continue;
+        }
+        // Collect links for all neighbor candidates
+        let mut link_counts: HashMap<String, usize> = HashMap::new();
+
+        // Target file's imports
+        if let Some(entry) = idx.get_file(&target.path) {
+            for imp in &entry.imports {
+                if let Some(ref res) = imp.resolved {
+                    if res != &target.path {
+                        *link_counts.entry(res.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        // Files that import target
+        for f in &idx.files {
+            if f.path != target.path {
+                for imp in &f.imports {
+                    if imp.resolved.as_deref() == Some(&target.path) {
+                        *link_counts.entry(f.path.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        // Sort by links descending, then path ascending for determinism
+        let mut sorted: Vec<(String, usize)> = link_counts.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        sorted.truncate(max_neighbors);
+
+        let neighbor_weight = w_neighbor * target.weight;
+        if neighbor_weight <= 0.0 {
+            continue;
+        }
+
+        for (neighbor_path, _) in sorted {
+            if let Some(existing) = out.iter_mut().find(|t| t.path == neighbor_path) {
+                // If existing is already a direct target, it keeps neighbor_of = None
+                // and weight is max(existing, neighbor)
+                if existing.neighbor_of.is_none() {
+                    existing.weight = existing.weight.max(neighbor_weight);
+                } else if neighbor_weight > existing.weight {
+                    // Both are neighbors: keep higher weight
+                    existing.weight = neighbor_weight;
+                    existing.neighbor_of = Some(target.path.clone());
+                }
+            } else {
+                out.push(Target {
+                    path: neighbor_path,
+                    symbols: vec![],
+                    weight: neighbor_weight,
+                    diff_lines: 0,
+                    neighbor_of: Some(target.path.clone()),
+                });
+            }
+        }
+    }
+
+    out
+}
+
+/// Splits raw prompt text by characters that are not identifier characters, preserving `::` segments.
+pub fn extract_raw_identifiers(text: &str) -> Vec<String> {
+    let mut idents = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    while i < n {
+        if chars[i].is_ascii_alphanumeric() || chars[i] == '_' {
+            let start = i;
+            while i < n {
+                if chars[i].is_ascii_alphanumeric() || chars[i] == '_' {
+                    i += 1;
+                } else if i + 1 < n && chars[i] == ':' && chars[i + 1] == ':' {
+                    i += 2;
+                } else {
+                    break;
+                }
+            }
+            let word: String = chars[start..i].iter().collect();
+            let trimmed = word.trim_matches(':');
+            if !trimmed.is_empty() && !idents.contains(&trimmed.to_string()) {
+                idents.push(trimmed.to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    idents
+}
+
+/// Identifies symbol names in `prompt` that exactly match non-test symbols in `index`,
+/// creating targets with weight `w_symbol` and `target.symbols = [symbol_name]`.
+pub fn identifier_targets(
+    prompt: &str,
+    index: Option<&ProjectIndex>,
+    w_symbol: f32,
+    min_len: usize,
+    max_defs: usize,
+) -> Vec<Target> {
+    if w_symbol <= 0.0 {
+        return Vec::new();
+    }
+    let idx = match index {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+
+    let raw_tokens = extract_raw_identifiers(prompt);
+    let mut targets = Vec::new();
+
+    for token in raw_tokens {
+        // Also consider the leaf method if token was Type::method
+        let mut candidates = vec![token.clone()];
+        if let Some((_, leaf)) = token.split_once("::") {
+            if !leaf.contains("::") && !candidates.contains(&leaf.to_string()) {
+                candidates.push(leaf.to_string());
+            }
+        }
+
+        for cand in candidates {
+            if cand.len() < min_len {
+                continue;
+            }
+
+            let mut def_files = Vec::new();
+            let (target_parent, target_name) = if let Some((p, n)) = cand.split_once("::") {
+                (Some(p), n)
+            } else {
+                (None, cand.as_str())
+            };
+
+            for file in &idx.files {
+                for s in &file.symbols {
+                    if s.test {
+                        continue;
+                    }
+                    if s.name == target_name {
+                        if let Some(req_p) = target_parent {
+                            if s.parent.as_deref() == Some(req_p) && !def_files.contains(&file.path) {
+                                def_files.push(file.path.clone());
+                            }
+                        } else if !def_files.contains(&file.path) {
+                            def_files.push(file.path.clone());
+                        }
+                    }
+                }
+            }
+
+            if def_files.is_empty() || def_files.len() > max_defs {
+                continue;
+            }
+
+            for file_path in def_files {
+                if let Some(existing) = targets.iter_mut().find(|t: &&mut Target| t.path == file_path) {
+                    existing.weight = existing.weight.max(w_symbol);
+                    if !existing.symbols.contains(&target_name.to_string()) {
+                        existing.symbols.push(target_name.to_string());
+                    }
+                } else {
+                    targets.push(Target {
+                        path: file_path,
+                        symbols: vec![target_name.to_string()],
+                        weight: w_symbol,
+                        diff_lines: 0,
+                        neighbor_of: None,
+                    });
+                }
+            }
+        }
+    }
+
+    targets
+}
+
+/// Merges additional targets into `base`. Direct targets take precedence over neighbor targets
+/// and symbols are combined.
+pub fn merge_targets(base: &mut Vec<Target>, additions: Vec<Target>) {
+    base.retain(|t| t.weight > 0.0);
+    for add in additions {
+        if add.weight <= 0.0 {
+            continue;
+        }
+        if let Some(existing) = base.iter_mut().find(|t| t.path == add.path) {
+            if existing.neighbor_of.is_none() {
+                existing.weight = existing.weight.max(add.weight);
+            } else if add.neighbor_of.is_none() {
+                existing.weight = existing.weight.max(add.weight);
+                existing.neighbor_of = None;
+            } else if add.weight > existing.weight {
+                existing.weight = add.weight;
+                existing.neighbor_of = add.neighbor_of;
+            }
+            for sym in add.symbols {
+                if !existing.symbols.contains(&sym) {
+                    existing.symbols.push(sym);
+                }
+            }
+        } else {
+            base.push(add);
+        }
+    }
+}
+
+/// Computes for each node ID whether it was retrieved strictly via a neighbor target
+/// (and not a direct target). Direct targets win ties.
+pub fn node_neighbor_origins(m: &Memory, targets: &[Target], ids: &[u32]) -> HashMap<u32, String> {
+    let mut map = HashMap::new();
+    for &id in ids {
+        let n = &m.nodes[id as usize];
+        let mut best_direct_score = 0.0f32;
+        let mut best_neighbor_score = 0.0f32;
+        let mut best_neighbor_origin = None;
+
+        for t in targets {
+            if t.weight <= 0.0 {
+                continue;
+            }
+            let aff = t.weight * affinity(&n.path, &n.symbol, t);
+            if aff <= 0.0 {
+                continue;
+            }
+            if let Some(ref origin) = t.neighbor_of {
+                if aff > best_neighbor_score {
+                    best_neighbor_score = aff;
+                    best_neighbor_origin = Some(origin.clone());
+                }
+            } else if aff >= best_direct_score {
+                best_direct_score = aff;
+            }
+        }
+
+        // Direct wins ties
+        if best_neighbor_score > best_direct_score {
+            if let Some(origin) = best_neighbor_origin {
+                map.insert(id, origin);
+            }
+        }
+    }
+    map
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_direct_target_wins_over_neighbor_and_keeps_direct_affinity() {
+        let mut m = Memory::default();
+        let n_id = m.add_node(crate::model::Node {
+            id: 0,
+            kind: crate::model::NodeKind::Rule,
+            origin: crate::model::Origin::User,
+            flags: 0,
+            path: "src/main.rs".to_string(),
+            symbol: String::new(),
+            branch: String::new(),
+            commit: String::new(),
+            y: 1.0,
+            alpha: 4.0,
+            beta: 1.0,
+            activation: 0.0,
+            recalls: 0,
+            created_session: 0,
+            key: String::new(),
+            label: "main rule".to_string(),
+            text: "rule text".to_string(),
+            aliases: vec![],
+        });
+
+        // Target 1: direct main.rs (weight 0.8)
+        // Target 2: neighbor main.rs (from cli.rs, weight 0.5)
+        let targets = vec![
+            Target::new("src/main.rs", 0.8),
+            Target {
+                path: "src/main.rs".to_string(),
+                symbols: vec![],
+                weight: 0.5,
+                diff_lines: 0,
+                neighbor_of: Some("src/cli.rs".to_string()),
+            },
+        ];
+
+        let s = seeds(&m, &targets);
+        // Direct affinity wins: 0.8 * 1.0 = 0.8 (not sum 1.3)
+        assert_eq!(s[n_id as usize], 0.8);
+
+        let origins = node_neighbor_origins(&m, &targets, &[n_id]);
+        assert!(!origins.contains_key(&n_id), "direct wins ties and higher scores, no neighbor_of");
+    }
+
+    #[test]
+    fn test_neighbors_bidirectional_import() {
+        use crate::index::{FileEntry, ProjectIndex};
+        use crate::lang_rust::Import;
+
+        let mut idx = ProjectIndex::default();
+        idx.files.push(FileEntry {
+            path: "src/a.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 10,
+            mtime: 10,
+            hash: 1,
+                    status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![Import {
+                raw: "use super::b;".to_string(),
+                resolved: Some("src/b.rs".to_string()),
+            }],
+            calls: vec![],
+        });
+        idx.files.push(FileEntry {
+            path: "src/b.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 10,
+            mtime: 10,
+            hash: 2,
+                    status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![],
+            calls: vec![],
+        });
+
+        // 1. Editing a.rs expands b.rs as neighbor
+        let base_a = vec![Target::new("src/a.rs", 1.0)];
+        let exp_a = expand_neighbors(&base_a, Some(&idx), W_NEIGHBOR, MAX_NEIGHBORS);
+        assert_eq!(exp_a.len(), 2);
+        assert_eq!(exp_a[1].path, "src/b.rs");
+        assert_eq!(exp_a[1].weight, 0.5);
+        assert_eq!(exp_a[1].neighbor_of.as_deref(), Some("src/a.rs"));
+
+        // 2. Editing b.rs expands a.rs as neighbor (reverse direction)
+        let base_b = vec![Target::new("src/b.rs", 1.0)];
+        let exp_b = expand_neighbors(&base_b, Some(&idx), W_NEIGHBOR, MAX_NEIGHBORS);
+        assert_eq!(exp_b.len(), 2);
+        assert_eq!(exp_b[1].path, "src/a.rs");
+        assert_eq!(exp_b[1].weight, 0.5);
+        assert_eq!(exp_b[1].neighbor_of.as_deref(), Some("src/b.rs"));
+    }
+
+    #[test]
+    fn test_no_neighbors_of_neighbors() {
+        use crate::index::{FileEntry, ProjectIndex};
+        use crate::lang_rust::Import;
+
+        let mut idx = ProjectIndex::default();
+        idx.files.push(FileEntry {
+            path: "src/a.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 10,
+            mtime: 10,
+            hash: 1,
+                    status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![Import { raw: "use b;".to_string(), resolved: Some("src/b.rs".to_string()) }],
+            calls: vec![],
+        });
+        idx.files.push(FileEntry {
+            path: "src/b.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 10,
+            mtime: 10,
+            hash: 2,
+                    status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![Import { raw: "use c;".to_string(), resolved: Some("src/c.rs".to_string()) }],
+            calls: vec![],
+        });
+        idx.files.push(FileEntry {
+            path: "src/c.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 10,
+            mtime: 10,
+            hash: 3,
+                    status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![],
+            calls: vec![],
+        });
+
+        let base_a = vec![Target::new("src/a.rs", 1.0)];
+        let exp_a = expand_neighbors(&base_a, Some(&idx), W_NEIGHBOR, MAX_NEIGHBORS);
+        // Only a.rs and b.rs; c.rs (neighbor of neighbor) must NOT be included
+        assert_eq!(exp_a.len(), 2);
+        assert!(exp_a.iter().any(|t| t.path == "src/b.rs"));
+        assert!(!exp_a.iter().any(|t| t.path == "src/c.rs"));
+    }
+
+    #[test]
+    fn test_max_neighbors_respected() {
+        use crate::index::{FileEntry, ProjectIndex};
+        use crate::lang_rust::Import;
+
+        let mut idx = ProjectIndex::default();
+        let mut a_imports = Vec::new();
+        for i in 1..=10 {
+            let neighbor_path = format!("src/n{i}.rs");
+            a_imports.push(Import { raw: format!("use n{i};"), resolved: Some(neighbor_path.clone()) });
+            idx.files.push(FileEntry {
+                path: neighbor_path,
+                lang: "rust".to_string(),
+                size: 10,
+                mtime: 10,
+                hash: i as u32,
+                    status: "-".to_string(),
+                symbols: vec![],
+                imports: vec![],
+                calls: vec![],
+            });
+        }
+        idx.files.push(FileEntry {
+            path: "src/a.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 10,
+            mtime: 10,
+            hash: 100,
+                    status: "-".to_string(),
+            symbols: vec![],
+            imports: a_imports,
+            calls: vec![],
+        });
+
+        let base_a = vec![Target::new("src/a.rs", 1.0)];
+        let exp_a = expand_neighbors(&base_a, Some(&idx), W_NEIGHBOR, 3);
+        // a.rs + at most 3 neighbors = 4 targets
+        assert_eq!(exp_a.len(), 4);
+    }
+
+    #[test]
+    fn test_identifier_targets_length_and_ambiguity_filters() {
+        use crate::index::{FileEntry, ProjectIndex};
+        use crate::lang_rust::Symbol;
+
+        let mut idx = ProjectIndex::default();
+        // Symbol "abc" (3 chars < 4): filtered out
+        idx.files.push(FileEntry {
+            path: "src/short.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 10,
+            mtime: 10,
+            hash: 1,
+                    status: "-".to_string(),
+            symbols: vec![Symbol {
+                name: "abc".to_string(),
+                kind: "fn".to_string(),
+                line: 1,
+                end_line: 2,
+                public: true,
+                parent: None,
+                test: false,
+                signature: String::new(),
+                decorators: Vec::new(),
+            }],
+            imports: vec![],
+            calls: vec![],
+        });
+
+        // Symbol "ubiquitous" in 4 files (> 3 files): filtered out
+        for i in 1..=4 {
+            idx.files.push(FileEntry {
+                path: format!("src/u{i}.rs"),
+                lang: "rust".to_string(),
+                size: 10,
+                mtime: 10,
+                hash: i as u32,
+                    status: "-".to_string(),
+                symbols: vec![Symbol {
+                    name: "ubiquitous".to_string(),
+                    kind: "fn".to_string(),
+                    line: 1,
+                    end_line: 2,
+                    public: true,
+                    parent: None,
+                    test: false,
+                    signature: String::new(),
+                    decorators: Vec::new(),
+                }],
+                imports: vec![],
+                calls: vec![],
+            });
+        }
+
+        // Symbol "saturate" in 1 file (non-test): accepted!
+        idx.files.push(FileEntry {
+            path: "src/hook.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 10,
+            mtime: 10,
+            hash: 50,
+                    status: "-".to_string(),
+            symbols: vec![Symbol {
+                name: "saturate".to_string(),
+                kind: "fn".to_string(),
+                line: 10,
+                end_line: 20,
+                public: true,
+                parent: None,
+                test: false,
+                signature: String::new(),
+                decorators: Vec::new(),
+            }],
+            imports: vec![],
+            calls: vec![],
+        });
+
+        // Symbol "test_helper" in 1 file with test: true: filtered out!
+        idx.files.push(FileEntry {
+            path: "src/test_mod.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 10,
+            mtime: 10,
+            hash: 60,
+                    status: "-".to_string(),
+            symbols: vec![Symbol {
+                name: "test_helper".to_string(),
+                kind: "fn".to_string(),
+                line: 10,
+                end_line: 20,
+                public: true,
+                parent: None,
+                test: true,
+                signature: String::new(),
+                decorators: Vec::new(),
+            }],
+            imports: vec![],
+            calls: vec![],
+        });
+
+        let prompt = "arregla abc, ubiquitous, test_helper y saturate()";
+        let targets = identifier_targets(prompt, Some(&idx), W_SYMBOL, MIN_IDENT_LEN, MAX_DEFS);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].path, "src/hook.rs");
+        assert_eq!(targets[0].symbols, vec!["saturate".to_string()]);
+        assert_eq!(targets[0].weight, 0.9);
+    }
+
+    #[test]
+    fn test_sigma_distinguishes_symbols_in_same_file() {
+        let mut m = Memory::default();
+        let _n_sat = m.add_node(crate::model::Node {
+            id: 0,
+            kind: crate::model::NodeKind::Rule,
+            origin: crate::model::Origin::User,
+            flags: 0,
+            path: "src/hook.rs".to_string(),
+            symbol: "saturate".to_string(),
+            branch: String::new(),
+            commit: String::new(),
+            y: 1.0,
+            alpha: 4.0,
+            beta: 1.0,
+            activation: 0.0,
+            recalls: 0,
+            created_session: 0,
+            key: String::new(),
+            label: "saturate rule".to_string(),
+            text: "rule text".to_string(),
+            aliases: vec![],
+        });
+        let _n_other = m.add_node(crate::model::Node {
+            id: 0,
+            kind: crate::model::NodeKind::Rule,
+            origin: crate::model::Origin::User,
+            flags: 0,
+            path: "src/hook.rs".to_string(),
+            symbol: "memory_size".to_string(),
+            branch: String::new(),
+            commit: String::new(),
+            y: 1.0,
+            alpha: 4.0,
+            beta: 1.0,
+            activation: 0.0,
+            recalls: 0,
+            created_session: 0,
+            key: String::new(),
+            label: "memory_size rule".to_string(),
+            text: "rule text".to_string(),
+            aliases: vec![],
+        });
+
+        let target = Target {
+            path: "src/hook.rs".to_string(),
+            symbols: vec!["saturate".to_string()],
+            weight: 0.9,
+            diff_lines: 0,
+            neighbor_of: None,
+        };
+
+        let aff_sat = affinity("src/hook.rs", "saturate", &target);
+        let aff_other = affinity("src/hook.rs", "memory_size", &target);
+
+        // Matching symbol gets full affinity 1.0; different symbol gets OTHER_SYMBOL 0.5
+        assert_eq!(aff_sat, 1.0);
+        assert_eq!(aff_other, 0.5);
+    }
+
     use super::*;
     use crate::learn::{learn, Claim};
 
@@ -550,5 +1186,81 @@ rename to src/physics/collider.rs
                 ("src/physics/collider.rs".to_string(), "src/sim/collider.rs".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn test_zero_or_negative_weight_targets_are_discarded() {
+        use crate::index::{FileEntry, ProjectIndex};
+        use crate::lang_rust::{Import, Symbol};
+
+        let mut idx = ProjectIndex::default();
+        idx.files.push(FileEntry {
+            path: "src/a.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 100,
+            mtime: 10,
+            hash: 1,
+                    status: "-".to_string(),
+            symbols: vec![Symbol {
+                name: "calculate_crc".to_string(),
+                kind: "fn".to_string(),
+                line: 1,
+                end_line: 2,
+                public: true,
+                parent: None,
+                test: false,
+                signature: String::new(),
+                decorators: Vec::new(),
+            }],
+            imports: vec![Import {
+                raw: "use b;".to_string(),
+                resolved: Some("src/b.rs".to_string()),
+            }],
+            calls: vec![],
+        });
+        idx.files.push(FileEntry {
+            path: "src/b.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 50,
+            mtime: 10,
+            hash: 2,
+                    status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![],
+            calls: vec![],
+        });
+
+        // 1. identifier_targets with w_symbol <= 0 returns empty vec
+        let id_zero = identifier_targets("call calculate_crc", Some(&idx), 0.0, 4, 3);
+        assert!(id_zero.is_empty());
+        let id_neg = identifier_targets("call calculate_crc", Some(&idx), -0.5, 4, 3);
+        assert!(id_neg.is_empty());
+
+        // 2. expand_neighbors with w_neighbor <= 0 discards zero/negative targets and creates no neighbors
+        let base = vec![
+            Target::new("src/a.rs", 1.0),
+            Target::new("src/dead.rs", 0.0),
+            Target::new("src/neg.rs", -1.0),
+        ];
+        let exp_zero = expand_neighbors(&base, Some(&idx), 0.0, 5);
+        assert_eq!(exp_zero.len(), 1);
+        assert_eq!(exp_zero[0].path, "src/a.rs");
+
+        // 3. expand_neighbors with w_neighbor > 0 ignores base targets with weight <= 0
+        let exp = expand_neighbors(&base, Some(&idx), 0.5, 5);
+        assert_eq!(exp.len(), 2);
+        assert_eq!(exp[0].path, "src/a.rs");
+        assert_eq!(exp[1].path, "src/b.rs");
+
+        // 4. merge_targets drops <= 0 additions and cleans up <= 0 base
+        let mut merged = base.clone();
+        let adds = vec![
+            Target::new("src/valid.rs", 0.8),
+            Target::new("src/zero.rs", 0.0),
+        ];
+        merge_targets(&mut merged, adds);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].path, "src/a.rs");
+        assert_eq!(merged[1].path, "src/valid.rs");
     }
 }

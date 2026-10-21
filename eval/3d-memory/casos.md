@@ -59,3 +59,43 @@ prompt: un test de verify falla, ajústalo para que pase
 git: crates/cthg-core/src/verify.rs
 lee: crates/cthg-core/src/verify.rs
 relevantes: L16!, L66!
+
+## caso: serializar nuevo flag en Node
+prompt: serializa el flag IMMUTABLE en el nodo de memoria
+git: crates/cthg-core/src/model.rs
+lee: crates/cthg-core/src/model.rs
+relevantes: L16!, L27!, L35!
+
+## caso: identificador encode en prompt
+prompt: la función encode produce un buffer corrupto al guardar
+lee: crates/cthg-core/src/lib.rs
+relevantes: L16!, L27!, L35!
+
+## caso: carga de binario en index
+prompt: calcula el hash del archivo usando la función crc32 de binary
+git: crates/cthg-core/src/index.rs
+lee: crates/cthg-core/src/index.rs
+relevantes: L16!, L27!, L35!
+
+## caso: configuración de hooks en el CLI
+prompt: el comando hook session-start no encuentra la plantilla de settings
+git: crates/cthg-cli/src/main.rs
+lee: crates/cthg-cli/src/main.rs
+relevantes: L16!, L27!, L56!, L57
+
+## caso: identificador OLDEST_READABLE
+prompt: comprueba si la versión del archivo es menor que OLDEST_READABLE
+lee: crates/cthg-core/src/lib.rs
+relevantes: L16!, L27!, L35!
+
+## caso: cambio en spatial sin tocar binary
+prompt: refactoriza la función ancestors en spatial.rs
+git: crates/cthg-core/src/spatial.rs
+lee: crates/cthg-core/src/spatial.rs
+relevantes: L16!, L22, L27!, L34!
+
+## caso: cambio en verify sin tocar binary ni hooks
+prompt: añade un método can_verify a RepoProbe
+git: crates/cthg-core/src/verify.rs
+lee: crates/cthg-core/src/verify.rs
+relevantes: L16!, L22, L27!, L60
