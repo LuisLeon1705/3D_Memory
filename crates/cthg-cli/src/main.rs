@@ -1137,7 +1137,10 @@ fn run_antigravity(raw: &str) -> Result<String, String> {
     // `EPHEMERAL_MESSAGE` steps and the model still sees them next turn): the CORE goes once,
     // and nothing already injected in this conversation is injected again.
     if session.turn == -1 {
-        let mut core = hook::core_context(&mut m, &v, &mut session, global.as_ref());
+        let (mut core, global_ids) = hook::core_context_with_global(&mut m, &v, &mut session, global.as_ref());
+        if !global_ids.is_empty() {
+            hook::record_global_recalls(&repo.root.join(DIR), &global_ids);
+        }
         let has_code_index = idx.as_ref().is_some_and(|i| !i.files.is_empty());
         if has_code_index {
             if !core.is_empty() {
@@ -1233,7 +1236,10 @@ fn run_hook(rest: &[String]) -> Result<(), String> {
             session.native = native();
             let v = view(&repo, &m);
             let global = load_global();
-            let mut out = hook::handle_session_start_layered(&mut m, &v, &mut session, global.as_ref());
+            let (mut out, global_ids) = hook::handle_session_start_layered_with_global(&mut m, &v, &mut session, global.as_ref());
+            if !global_ids.is_empty() {
+                hook::record_global_recalls(&repo.root.join(DIR), &global_ids);
+            }
             let has_code_index = idx.as_ref().is_some_and(|i| !i.files.is_empty());
             if has_code_index {
                 if !out.is_empty() {

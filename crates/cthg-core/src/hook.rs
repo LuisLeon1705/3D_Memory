@@ -400,14 +400,19 @@ pub fn handle_session_start(m: &mut Memory, view: &View, session: &mut SessionSt
 }
 
 /// The user's global `CORE` (rules for every project), within `budget`. Read-only: the global
-/// memory is shared by every project, so a session never changes it. Returns the text and the
-/// tokens it used. Global ids print as `#g3` so they are not confused with the project's.
+/// memory is shared by every project, so a session never changes it. Returns the text, the
+/// tokens it used, tokenized rules, and the injected node ids. Global ids print as `#g3`.
 pub fn global_core(global: &Memory, budget: usize) -> (String, usize, Vec<Vec<String>>) {
+    let (out, used, toks, _) = global_core_with_ids(global, budget);
+    (out, used, toks)
+}
+
+pub fn global_core_with_ids(global: &Memory, budget: usize) -> (String, usize, Vec<Vec<String>>, Vec<u32>) {
     let scores = score::score_all(global, &View::all());
     let all = retrieve::core(global, &scores);
     let ids = retrieve::fit_budget(global, &all, budget, |n| render_node(global, &scores, n));
     if ids.is_empty() {
-        return (String::new(), 0, Vec::new());
+        return (String::new(), 0, Vec::new(), Vec::new());
     }
     let used: usize = ids.iter().map(|&id| text::approx_tokens(&render_node(global, &scores, &global.nodes[id as usize]))).sum();
     let mut out = format_bands("## Reglas globales (siempre, en todos los proyectos)", global, &scores, &ids).replace("\n- #", "\n- #g");
@@ -415,20 +420,66 @@ pub fn global_core(global: &Memory, budget: usize) -> (String, usize, Vec<Vec<St
         out.push_str(&format!("\n({} reglas globales no caben aquí; `cthg core --global` las muestra todas)", all.len() - ids.len()));
     }
     let toks = ids.iter().map(|&id| text::tokens(&global.nodes[id as usize].text)).collect();
-    (out, used, toks)
+    (out, used, toks, ids)
 }
 
 /// A project rule that says what a global rule already said is not injected twice.
 pub const DUPLICATE_OF_GLOBAL: f32 = 0.5;
 
+/// Name of the JSON file storing global rule recalls in `.cthg/`.
+pub const GLOBAL_RECALLS_FILE: &str = "global_recalls.json";
+
+/// Loads the counts of global rules injected in this repository from `.cthg/global_recalls.json`.
+pub fn load_global_recalls(cthg_dir: &Path) -> HashMap<u32, u32> {
+    let mut map = HashMap::new();
+    let path = cthg_dir.join(GLOBAL_RECALLS_FILE);
+    let Ok(content) = fs::read_to_string(&path) else { return map };
+    if let Some(crate::json::Json::Obj(entries)) = crate::json::Json::parse(&content) {
+        for (k, v) in entries {
+            if let (Ok(id), Some(num)) = (k.parse::<u32>(), v.num()) {
+                map.insert(id, num as u32);
+            }
+        }
+    }
+    map
+}
+
+/// Records that `ids` from the global memory were injected into an agent session in this repository.
+/// Increments their counters in `.cthg/global_recalls.json`.
+pub fn record_global_recalls(cthg_dir: &Path, ids: &[u32]) {
+    if ids.is_empty() {
+        return;
+    }
+    let mut counts = load_global_recalls(cthg_dir);
+    for &id in ids {
+        *counts.entry(id).or_default() += 1;
+    }
+    let mut entries: Vec<(&u32, &u32)> = counts.iter().collect();
+    entries.sort_by_key(|(k, _)| *k);
+    let mut out = String::from("{\n");
+    for (i, (k, v)) in entries.iter().enumerate() {
+        if i > 0 {
+            out.push_str(",\n");
+        }
+        out.push_str(&format!("  \"{}\": {}", k, v));
+    }
+    out.push_str("\n}\n");
+    let _ = fs::create_dir_all(cthg_dir);
+    let _ = fs::write(cthg_dir.join(GLOBAL_RECALLS_FILE), out);
+}
+
 /// Session start with the global layer first: global `CORE`, then the project's `CORE` in the
 /// budget left, skipping project rules that repeat a global one.
 pub fn handle_session_start_layered(m: &mut Memory, view: &View, session: &mut SessionState, global: Option<&Memory>) -> String {
+    handle_session_start_layered_with_global(m, view, session, global).0
+}
+
+pub fn handle_session_start_layered_with_global(m: &mut Memory, view: &View, session: &mut SessionState, global: Option<&Memory>) -> (String, Vec<u32>) {
     session.injected.clear();
     session.spent = 0;
     learn::begin_session(m);
     session.started = true;
-    core_context(m, view, session, global)
+    core_context_with_global(m, view, session, global)
 }
 
 /// The `CORE` text (global layer, then the project's) without starting a session: for agents
@@ -436,7 +487,11 @@ pub fn handle_session_start_layered(m: &mut Memory, view: &View, session: &mut S
 /// When `S ≤ WHOLE_MAX`, a small memory goes in whole: `CORE` first, then the remaining
 /// injectable nodes by χ, within `max(budgets.core, S)`.
 pub fn core_context(m: &mut Memory, view: &View, session: &mut SessionState, global: Option<&Memory>) -> String {
-    let (global_out, _, global_toks) = global.map(|g| global_core(g, GLOBAL_CORE_MAX)).unwrap_or_default();
+    core_context_with_global(m, view, session, global).0
+}
+
+pub fn core_context_with_global(m: &mut Memory, view: &View, session: &mut SessionState, global: Option<&Memory>) -> (String, Vec<u32>) {
+    let (global_out, _, global_toks, global_ids) = global.map(|g| global_core_with_ids(g, GLOBAL_CORE_MAX)).unwrap_or_default();
     let budgets = Budgets::of(m);
     let scores = score::score_all(m, view);
     let mut base = retrieve::core(m, &scores);
@@ -469,7 +524,7 @@ pub fn core_context(m: &mut Memory, view: &View, session: &mut SessionState, glo
     let budget = cap.min(remaining(&budgets, session));
     let ids = retrieve::fit_budget(m, &candidates, budget, |n| render_node(m, &scores, n));
     if ids.is_empty() {
-        return global_out;
+        return (global_out, global_ids);
     }
     session.spent += tokens_of(m, &scores, &ids) as u64;
     session.record(&ids);
@@ -485,11 +540,12 @@ pub fn core_context(m: &mut Memory, view: &View, session: &mut SessionState, glo
     if missing_core > 0 {
         out.push_str(&format!("\n({missing_core} reglas del núcleo no caben aquí; `cthg core` las muestra todas)"));
     }
-    if global_out.is_empty() {
+    let res = if global_out.is_empty() {
         out
     } else {
         format!("{global_out}\n\n{out}")
-    }
+    };
+    (res, global_ids)
 }
 
 /// Runs `prompt` with optional code index: fuses lexical, git spatial, neighbor expansion,
@@ -1270,5 +1326,30 @@ assert!(!scores[old_core as usize].superseded, "old core is no longer superseded
         // Must terminate safely without infinite loop
         let line = render_node(&m, &scores, &m.nodes[dec as usize]);
         assert!(line.contains("Decision relying on n1"));
+    }
+
+    #[test]
+    fn test_record_and_load_global_recalls() {
+        let dir = std::env::temp_dir().join(format!("cthg-recalls-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+
+        let ids = vec![0, 1, 5];
+        record_global_recalls(&dir, &ids);
+        let m1 = load_global_recalls(&dir);
+        assert_eq!(m1.get(&0), Some(&1));
+        assert_eq!(m1.get(&1), Some(&1));
+        assert_eq!(m1.get(&5), Some(&1));
+        assert_eq!(m1.get(&2), None);
+
+        // Record again with overlap
+        record_global_recalls(&dir, &[1, 2]);
+        let m2 = load_global_recalls(&dir);
+        assert_eq!(m2.get(&0), Some(&1));
+        assert_eq!(m2.get(&1), Some(&2));
+        assert_eq!(m2.get(&2), Some(&1));
+        assert_eq!(m2.get(&5), Some(&1));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
