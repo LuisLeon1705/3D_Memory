@@ -653,11 +653,19 @@ pub fn scan_rust(content: &str) -> FileScan {
             if is_ident(&prev.text) && !is_keyword(&prev.text) && !is_excluded_call(&prev.text) {
                 let is_macro = i >= 2 && tokens[i - 2].text == "!";
                 if !is_macro {
+                    let has_receiver = i >= 2 && tokens[i - 2].text == ".";
+                    let qualifier = if !has_receiver && i >= 3 && tokens[i - 2].text == "::" && is_ident(&tokens[i - 3].text) {
+                        Some(tokens[i - 3].text.clone())
+                    } else {
+                        None
+                    };
                     let from = current_caller_from(&stack);
                     scan.calls.push(Call {
                         from,
                         name: prev.text.clone(),
                         line: prev.line,
+                        has_receiver,
+                        qualifier,
                     });
                 }
             }

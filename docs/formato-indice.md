@@ -65,11 +65,13 @@ I	<raw>	<resolved>
 
 #### Línea `C` — Llamada
 ```tsv
-C	<from>	<name>	<line>
+C	<from>	<name>	<line>	<receiver>	<qualifier>
 ```
 - `from`: Símbolo que encierra la llamada (ej. `saturate` o `tag#id` en HTML). Si la llamada ocurre fuera de una función, se escribe `-`.
 - `name`: Nombre de la función o método invocado (ej. `saturate`).
 - `line`: Línea 1-based donde ocurre la llamada.
+- `receiver`: `1` si la llamada tiene un receptor explícito (`.nombre(` o `?.nombre(`), `0` en caso contrario. Opcional para retrocompatibilidad (por defecto `0`).
+- `qualifier`: Nombre del tipo contenedor si la llamada es cualificada explícitamente (`Tipo::nombre(` o `Tipo.nombre(`). Si no aplica o es una función libre / método sin cualificar, se escribe `-`.
 
 ---
 

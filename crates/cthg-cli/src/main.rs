@@ -50,7 +50,7 @@ const HELP: &str = "cthg — memoria de proyecto (ruta · tiempo · confianza)
   cthg index [--rebuild]
   cthg map [ruta] [--limit N]
   cthg where <símbolo>
-  cthg callers <símbolo> [--tests]
+  cthg callers <símbolo> [--tests] [--posibles]
   cthg list [--all]
   cthg mv <de> <a>       (la memoria sigue a un archivo o carpeta movidos)
   cthg import <archivo.md> [--yes]
@@ -882,10 +882,17 @@ escrito: {}", path.display());
                 );
             }
             let show_tests = a.flag("tests");
+            let show_posibles = a.flag("posibles");
             let normal_callers: Vec<_> = res.callers.iter().filter(|c| !c.is_test).collect();
             let test_callers: Vec<_> = res.callers.iter().filter(|c| c.is_test).collect();
+            let normal_posibles: Vec<_> = res.posibles.iter().filter(|c| !c.is_test).collect();
+            let test_posibles: Vec<_> = res.posibles.iter().filter(|c| c.is_test).collect();
 
-            if normal_callers.is_empty() && test_callers.is_empty() {
+            if normal_callers.is_empty()
+                && test_callers.is_empty()
+                && normal_posibles.is_empty()
+                && test_posibles.is_empty()
+            {
                 println!("no se encontraron llamadas a '{sym}'");
                 return Ok(());
             }
@@ -911,6 +918,32 @@ escrito: {}", path.display());
                 }
             } else if !test_callers.is_empty() {
                 println!("({} llamadas en tests, usa --tests para verlas)", test_callers.len());
+            }
+
+            if show_posibles {
+                let list = if show_tests {
+                    let mut all = normal_posibles;
+                    all.extend(test_posibles);
+                    all
+                } else {
+                    normal_posibles
+                };
+                if !list.is_empty() {
+                    println!("[posibles (por nombre)]");
+                    for c in list {
+                        if c.from == "(nivel de módulo)" {
+                            println!("{}:{} (nivel de módulo)", c.path, c.line);
+                        } else {
+                            println!("{}:{} (dentro de {})", c.path, c.line, c.from);
+                        }
+                    }
+                }
+            } else {
+                let total = normal_posibles.len() + if show_tests { test_posibles.len() } else { 0 };
+                let count = if show_tests { total } else { normal_posibles.len() };
+                if count > 0 {
+                    println!("({} posibles por nombre, usa --posibles para verlas)", count);
+                }
             }
         }
         "map" => {

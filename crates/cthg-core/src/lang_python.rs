@@ -477,11 +477,13 @@ pub fn scan_python(source: &str) -> FileScan {
 
         // Calls extraction: `name(` or `obj.name(`
         let caller_name = current_caller(&scope_stack);
-        for call_name in extract_calls(trimmed) {
+        for call_item in extract_calls(trimmed) {
             scan.calls.push(Call {
                 from: caller_name.clone(),
-                name: call_name,
+                name: call_item.name,
                 line: line_num,
+                has_receiver: call_item.has_receiver,
+                qualifier: call_item.qualifier,
             });
         }
 
@@ -582,8 +584,14 @@ pub fn parse_py_import(raw: &str) -> Vec<String> {
     imports
 }
 
-/// Extracts call names `foo(` and `obj.foo(` while skipping Python keywords.
-fn extract_calls(line: &str) -> Vec<String> {
+struct PyCall {
+    name: String,
+    has_receiver: bool,
+    qualifier: Option<String>,
+}
+
+/// Extracts calls `foo(`, `obj.foo(`, and `Type.foo(` while skipping Python keywords.
+fn extract_calls(line: &str) -> Vec<PyCall> {
     let mut calls = Vec::new();
     let chars: Vec<char> = line.chars().collect();
     let n = chars.len();
@@ -608,8 +616,38 @@ fn extract_calls(line: &str) -> Vec<String> {
             }
             if end_ident > j {
                 let name: String = chars[j..end_ident].iter().collect();
-                if is_ident(&name) && !PY_KEYWORDS.contains(&name.as_str()) && !calls.contains(&name) {
-                    calls.push(name);
+                if is_ident(&name) && !PY_KEYWORDS.contains(&name.as_str()) {
+                    let mut k = j;
+                    while k > 0 && chars[k - 1].is_whitespace() {
+                        k -= 1;
+                    }
+                    let mut has_receiver = false;
+                    let mut qualifier = None;
+                    if k > 0 && chars[k - 1] == '.' {
+                        let mut m = k - 1;
+                        while m > 0 && chars[m - 1].is_whitespace() {
+                            m -= 1;
+                        }
+                        let end_qual = m;
+                        while m > 0 && (chars[m - 1].is_alphanumeric() || chars[m - 1] == '_') {
+                            m -= 1;
+                        }
+                        if end_qual > m {
+                            let qual: String = chars[m..end_qual].iter().collect();
+                            if qual.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
+                                qualifier = Some(qual);
+                            } else {
+                                has_receiver = true;
+                            }
+                        } else {
+                            has_receiver = true;
+                        }
+                    }
+                    calls.push(PyCall {
+                        name,
+                        has_receiver,
+                        qualifier,
+                    });
                 }
             }
         }

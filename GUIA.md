@@ -374,13 +374,23 @@ El canal espacial original solo conocía el árbol de carpetas (en `spatial.rs`:
 - **Lo diferido a la fase 8f**: la base de datos (tablas, consultas por función, modelos ORM) y las rutas HTTP quedan para la 8f. La 8c preserva los decoradores de Python para que la 8f no requiera cambiar la versión del formato de índice.
 - **Sin dependencias**: escáneres léxicos escritos a mano en `cthg-core`, sin parsers pesados ni ASTs externos.
 - **Almacenamiento**: `.cthg/indice.tsv` (formato TSV plano `cthg-indice 2`, con escritura atómica mediante PID temporal `.cthg/indice.tsv.<pid>.tmp`). Se ignora en Git mediante `.cthg/.gitignore`.
+- **Resolución de llamadas y lista de exclusión de biblioteca estándar**:
+  - Para evitar hiperconexiones espurias («grafo completo») al invocar métodos comunes sobre tipos de la biblioteca estándar o contenedores genéricos (`HashMap`, `Vec`, `str`, `dict`, `Array`), una llamada con receptor (`.nombre(` o `?.nombre(`) **solo se enlaza** si:
+    1. La definición de destino es un método (tiene `parent` contenedor).
+    2. El archivo que realiza la llamada es el mismo archivo o importa directamente el archivo de la definición.
+    En `call_edges` no se genera arista si no se cumple; en `cthg callers`, las llamadas con receptor no importadas salen aparte bajo «posibles (por nombre)» y solo se visualizan mediante el flag `--posibles`.
+  - Las llamadas a funciones libres (`nombre(`) o cualificadas por tipo (`Tipo::nombre(`) enlazan normalmente, priorizando archivos importados cuando existen múltiples definiciones del mismo nombre (hasta un máximo de 3 antes de considerarse ambiguas).
+  - **Métodos estándar nunca enlazados por nombre sin tipo**:
+    - **Rust**: `get`, `parse`, `len`, `push`, `iter`, `map`, `insert`, `contains`, `clone`, `new`, `from`, `into`, `to_string`, `as_str`, `is_empty`, `pop`, `unwrap`, `expect`, `as_bytes`, `trim`, `split`, `collect`.
+    - **Python**: `get`, `append`, `items`, `keys`, `split`, `join`, `format`, `pop`, `extend`, `values`, `strip`, `replace`, `startswith`, `endswith`, `update`.
+    - **JS/TS**: `get`, `set`, `push`, `map`, `filter`, `forEach`, `then`, `join`, `pop`, `find`, `includes`, `indexOf`, `split`, `slice`, `catch`, `trim`.
 
 #### Fases del grafo de código (8a - 8f)
 - **8a (completada)**: Escáner de Rust, `.cthg/indice.tsv`, comandos CLI `cthg index`, `cthg map`, `cthg where` y `cthg callers`.
 - **8b (completada)**: Enrutado por vecinos e identificadores de código con eval (el canal espacial propaga afinidad hacia importaciones directas a 1 salto e identificadores del prompt; actualización del índice en `session-start` y primer turno de Antigravity con timeout de 500 ms).
 - **8c (completada)**: Escáneres políglotas (Python, JS/TS, HTML), firmas en todos los lenguajes, decoradores de Python, formato v2 y filtros de bundle/ruido.
 - **8d (completada)**: Canal pedido: `cthg map` reordenado (reglas arriba, en vecinos, importaciones y símbolos abajo; soporte para archivos no indexados y archivos nuevos con sus reglas de carpeta y hermanos), skill `project-memory` («Antes de escribir código»), sugerencia de mapa en CORE al iniciar sesión si hay índice y hooks silenciosos ante pánicos.
-- **8e**: Visor 3D (`memviz`): visualización interactiva del grafo de código y la memoria causal.
+- **8e (completada)**: Visor 3D (`memviz`): visualización interactiva del grafo de código junto al hipergrafo de memoria, capas activables (memoria, código, importaciones, llamadas), alcance visual de reglas y panel `file_map`, estrictamente de solo lectura sobre `.cthg/indice.tsv`.
 - **8f**: Base de datos y rutas HTTP: tablas y consultas por función, modelos ORM, decoradores de ruta; diseñarla tras verla en un proyecto real.
 
 *(Nota de ordenación: la fase 8 se implementa antes de la fase 7 para acelerar la orientación de los agentes).*
@@ -939,9 +949,9 @@ Criterio de éxito: ≥ 70 % menos tokens que `completo`, **cero** críticas per
 | 8b | Enrutado por vecinos e identificadores de código con eval (canal espacial extendido a importadores y dependencias a 1 salto, atribución de vecino, desempate directo) | ✅ (89 tests) |
 | 8c | Escáneres para más lenguajes (Python, JS/TS con JSX/TSX, HTML), firmas en todos los lenguajes, decoradores de Python, índice v2, aislamiento por familias y robustez ante pánicos | ✅ (109 tests) |
 | 8d | Canal pedido: `cthg map` reordenado (reglas arriba, archivos nuevos y no indexados), skill actualizada, línea en CORE de sesión y hooks silenciosos | ✅ (117 tests) |
-| 8e | Visor 3D (`memviz`): proyección del grafo de código junto al hipergrafo de memoria | pendiente |
+| 8e | Visor 3D (`memviz`): proyección del grafo de código junto al hipergrafo de memoria, capas activables, alcance de reglas y panel de archivo de solo lectura | ✅ (124 tests cthg + 8 tests memviz) |
 | 8f | Base de datos y rutas HTTP: tablas y consultas por función, modelos ORM, decoradores de ruta; diseñarla tras verla en un proyecto real | pendiente |
-| 7 | Ramas fusionadas visibles en el tronco, `gc`, visor 3D | pendiente (la fase 8 va antes que la 7) |
+| 7 | Ramas fusionadas visibles en el tronco, `gc` | pendiente (el visor 3D ya existe en `memviz`) |
 
 ---
 

@@ -109,6 +109,88 @@ pub struct Call {
     pub from: String,
     pub name: String,
     pub line: usize,
+    pub has_receiver: bool,
+    pub qualifier: Option<String>,
+}
+
+impl Call {
+    pub fn new(from: impl Into<String>, name: impl Into<String>, line: usize) -> Self {
+        Self {
+            from: from.into(),
+            name: name.into(),
+            line,
+            has_receiver: false,
+            qualifier: None,
+        }
+    }
+}
+
+/// Standard library methods that should never be linked by bare method name without type.
+pub fn is_stdlib_method(fam: LangFamily, method_name: &str) -> bool {
+    match fam {
+        LangFamily::Rust => matches!(
+            method_name,
+            "get"
+                | "parse"
+                | "len"
+                | "push"
+                | "iter"
+                | "map"
+                | "insert"
+                | "contains"
+                | "clone"
+                | "new"
+                | "from"
+                | "into"
+                | "to_string"
+                | "as_str"
+                | "is_empty"
+                | "pop"
+                | "unwrap"
+                | "expect"
+                | "as_bytes"
+                | "trim"
+                | "split"
+                | "collect"
+        ),
+        LangFamily::Python => matches!(
+            method_name,
+            "get"
+                | "append"
+                | "items"
+                | "keys"
+                | "split"
+                | "join"
+                | "format"
+                | "pop"
+                | "extend"
+                | "values"
+                | "strip"
+                | "replace"
+                | "startswith"
+                | "endswith"
+                | "update"
+        ),
+        LangFamily::Web => matches!(
+            method_name,
+            "get"
+                | "set"
+                | "push"
+                | "map"
+                | "filter"
+                | "forEach"
+                | "then"
+                | "join"
+                | "pop"
+                | "find"
+                | "includes"
+                | "indexOf"
+                | "split"
+                | "slice"
+                | "catch"
+                | "trim"
+        ),
+    }
 }
 
 /// The extracted symbols, imports, and calls from a single source file.

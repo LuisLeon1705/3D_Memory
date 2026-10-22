@@ -753,10 +753,21 @@ pub fn scan_js(_lang: Lang, source: &str) -> FileScan {
         // 8. Calls: `name(`, `obj.name(`, `new Name(`, or JSX `<Component`
         if is_ident(&tok.text) && i + 1 < n && tokens[i + 1].text == "(" && !is_js_keyword(&tok.text) {
             let caller_from = current_caller_from(&scope_stack, &scan.symbols);
+            let mut has_receiver = false;
+            let mut qualifier = None;
+            if i > 0 && (tokens[i - 1].text == "." || tokens[i - 1].text == "?.") {
+                if i >= 2 && is_ident(&tokens[i - 2].text) && tokens[i - 2].text.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
+                    qualifier = Some(tokens[i - 2].text.clone());
+                } else {
+                    has_receiver = true;
+                }
+            }
             scan.calls.push(Call {
                 from: caller_from,
                 name: tok.text.clone(),
                 line: tok.line,
+                has_receiver,
+                qualifier,
             });
         }
 
@@ -767,6 +778,8 @@ pub fn scan_js(_lang: Lang, source: &str) -> FileScan {
                 from: caller_from,
                 name: tokens[i + 1].text.clone(),
                 line: tok.line,
+                has_receiver: false,
+                qualifier: None,
             });
         }
 

@@ -179,10 +179,16 @@ pub fn parse_index(text: &str) -> Result<ProjectIndex, String> {
                 let from = parts[1].to_string();
                 let name = parts[2].to_string();
                 let line_num = parts[3].parse().map_err(|_| "línea inválida en C")?;
+                let has_receiver = parts.get(4).map(|s| *s == "1").unwrap_or(false);
+                let qualifier = parts
+                    .get(5)
+                    .and_then(|s| if *s == "-" || s.is_empty() { None } else { Some(s.to_string()) });
                 cur.calls.push(Call {
                     from,
                     name,
                     line: line_num,
+                    has_receiver,
+                    qualifier,
                 });
             }
             _ => {}
@@ -220,7 +226,12 @@ pub fn format_index(index: &ProjectIndex) -> String {
             out.push_str(&format!("I\t{}\t{}\n", i.raw, res_str));
         }
         for c in &file.calls {
-            out.push_str(&format!("C\t{}\t{}\t{}\n", c.from, c.name, c.line));
+            let rec_str = if c.has_receiver { "1" } else { "0" };
+            let qual_str = c.qualifier.as_deref().unwrap_or("-");
+            out.push_str(&format!(
+                "C\t{}\t{}\t{}\t{}\t{}\n",
+                c.from, c.name, c.line, rec_str, qual_str
+            ));
         }
     }
 
@@ -536,25 +547,40 @@ pub struct CallerItem {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CallersResult {
     pub callers: Vec<CallerItem>,
+    pub posibles: Vec<CallerItem>,
     pub is_ambiguous: bool,
     pub def_files_count: usize,
 }
 
 /// Finds all callers to `query`.
 pub fn callers(index: &ProjectIndex, query: &str) -> CallersResult {
-    let (_, target_name) = if let Some((_, n)) = query.split_once("::") {
-        (Some(()), n)
+    let (target_qualifier, target_name) = if let Some((q, n)) = query.split_once("::") {
+        (Some(q), n)
     } else {
         (None, query)
     };
 
-    // 1. Find defining files and their language families
-    let def_files: HashSet<String> = index
-        .files
-        .iter()
-        .filter(|f| f.symbols.iter().any(|s| s.name == target_name))
-        .map(|f| f.path.clone())
-        .collect();
+    // 1. Find defining files, symbols, and language families matching target_name
+    let mut def_files: HashSet<String> = HashSet::new();
+    let mut has_method_def = false;
+
+    for f in &index.files {
+        for s in &f.symbols {
+            if s.name == target_name {
+                if let Some(q) = target_qualifier {
+                    if s.parent.as_deref() == Some(q) {
+                        def_files.insert(f.path.clone());
+                        has_method_def = true;
+                    }
+                } else {
+                    def_files.insert(f.path.clone());
+                    if s.parent.is_some() {
+                        has_method_def = true;
+                    }
+                }
+            }
+        }
+    }
 
     let def_families: HashSet<lang::LangFamily> = index
         .files
@@ -581,6 +607,8 @@ pub fn callers(index: &ProjectIndex, query: &str) -> CallersResult {
 
     // 3. Collect calls, strictly respecting language family boundaries
     let mut callers = Vec::new();
+    let mut posibles = Vec::new();
+
     for file in &index.files {
         let file_fam = lang::Lang::from_name(&file.lang)
             .map(|l| l.family())
@@ -595,12 +623,61 @@ pub fn callers(index: &ProjectIndex, query: &str) -> CallersResult {
             || file.path.contains(".spec.");
 
         for call in &file.calls {
-            if call.name == target_name {
-                let is_test = file_is_test
-                    || file
-                        .symbols
-                        .iter()
-                        .any(|s| s.test && (s.name == call.from || call.from.ends_with(&format!("::{}", s.name))));
+            if call.name != target_name {
+                continue;
+            }
+
+            let is_test = file_is_test
+                || file
+                    .symbols
+                    .iter()
+                    .any(|s| s.test && (s.name == call.from || call.from.ends_with(&format!("::{}", s.name))));
+
+            if let Some(q) = &call.qualifier {
+                // Explicitly qualified call `Tipo::metodo(`
+                if let Some(tq) = target_qualifier {
+                    if q != tq {
+                        continue;
+                    }
+                }
+                let is_prioritized = importing_files.contains(&file.path);
+                callers.push(CallerItem {
+                    path: file.path.clone(),
+                    line: call.line,
+                    from: call.from.clone(),
+                    is_test,
+                    is_prioritized,
+                });
+            } else if call.has_receiver {
+                // Method call with receiver: `.nombre(`
+                // Blacklist check: standard library methods called without type never link!
+                if lang::is_stdlib_method(file_fam, &call.name) {
+                    continue;
+                }
+
+                let is_imported = importing_files.contains(&file.path);
+                if has_method_def && is_imported {
+                    callers.push(CallerItem {
+                        path: file.path.clone(),
+                        line: call.line,
+                        from: call.from.clone(),
+                        is_test,
+                        is_prioritized: true,
+                    });
+                } else if has_method_def {
+                    posibles.push(CallerItem {
+                        path: file.path.clone(),
+                        line: call.line,
+                        from: call.from.clone(),
+                        is_test,
+                        is_prioritized: false,
+                    });
+                }
+            } else {
+                // Free function call: `nombre(`
+                if target_qualifier.is_some() {
+                    continue;
+                }
                 let is_prioritized = importing_files.contains(&file.path);
                 callers.push(CallerItem {
                     path: file.path.clone(),
@@ -613,7 +690,6 @@ pub fn callers(index: &ProjectIndex, query: &str) -> CallersResult {
         }
     }
 
-    // Sort: prioritized first, then path, then line
     callers.sort_by(|a, b| {
         b.is_prioritized
             .cmp(&a.is_prioritized)
@@ -621,11 +697,193 @@ pub fn callers(index: &ProjectIndex, query: &str) -> CallersResult {
             .then_with(|| a.line.cmp(&b.line))
     });
 
+    posibles.sort_by(|a, b| {
+        a.path.cmp(&b.path).then_with(|| a.line.cmp(&b.line))
+    });
+
     CallersResult {
         callers,
+        posibles,
         is_ambiguous,
         def_files_count: def_count,
     }
+}
+
+/// Extracts resolved call edges (from_file, to_file, call_count) across the code index.
+///
+/// Follows the same resolution rules as `callers`:
+/// - Isolated by language family (Rust, Python, Web)
+/// - Ignores ambiguous symbols defined in > 3 files
+/// - Ignores calls originated from test files or test functions
+/// - Ignores self-calls (`from != to`)
+/// - Method calls `.nombre(`: only link if definition has parent and caller imports defining file
+/// - Discards bare receiver calls to standard library methods (get, parse, len...)
+/// - Prefer imported files among definitions of the same name for free or qualified calls
+pub fn call_edges(index: &ProjectIndex) -> Vec<(String, String, usize)> {
+    // 1. Map each symbol name to its defining entries (file, symbol)
+    let mut defs_by_name: HashMap<&str, Vec<(&FileEntry, &Symbol)>> = HashMap::new();
+    for f in &index.files {
+        for s in &f.symbols {
+            defs_by_name.entry(&s.name).or_default().push((f, s));
+        }
+    }
+
+    // 2. Precompute language family per file
+    let mut file_families: HashMap<&str, lang::LangFamily> = HashMap::new();
+    for f in &index.files {
+        let fam = lang::Lang::from_name(&f.lang)
+            .map(|l| l.family())
+            .unwrap_or(lang::LangFamily::Rust);
+        file_families.insert(&f.path, fam);
+    }
+
+    // 3. Collect calls
+    let mut edge_counts: HashMap<(String, String), usize> = HashMap::new();
+
+    for file in &index.files {
+        let file_is_test = file.path.contains("tests/")
+            || file.path.ends_with("_test.rs")
+            || file.path.ends_with("_test.py")
+            || file.path.contains(".test.")
+            || file.path.contains(".spec.");
+
+        let Some(&caller_fam) = file_families.get(file.path.as_str()) else {
+            continue;
+        };
+
+        for call in &file.calls {
+            let is_test = file_is_test
+                || file
+                    .symbols
+                    .iter()
+                    .any(|s| s.test && (s.name == call.from || call.from.ends_with(&format!("::{}", s.name))));
+            if is_test {
+                continue;
+            }
+
+            let Some(all_defs) = defs_by_name.get(call.name.as_str()) else {
+                continue;
+            };
+
+            // Ambiguity check: symbols defined in > 3 files are discarded
+            let mut unique_def_files: Vec<&str> = all_defs.iter().map(|(f, _)| f.path.as_str()).collect();
+            unique_def_files.sort_unstable();
+            unique_def_files.dedup();
+            if unique_def_files.len() > 3 {
+                continue;
+            }
+
+            if call.has_receiver {
+                // 1. `.nombre(` (método con receptor)
+                // Blacklist check: standard library methods called without type never link!
+                if lang::is_stdlib_method(caller_fam, &call.name) {
+                    continue;
+                }
+
+                // Only links if definition is a method (has parent) AND caller imports the definition file directly
+                let mut matched_files: HashSet<&str> = HashSet::new();
+                for &(def_file, sym) in all_defs {
+                    if sym.parent.is_none() {
+                        continue;
+                    }
+                    if def_file.path == file.path {
+                        continue; // no self-calls
+                    }
+                    if file_families.get(def_file.path.as_str()) != Some(&caller_fam) {
+                        continue;
+                    }
+                    let is_imported = file
+                        .imports
+                        .iter()
+                        .any(|imp| imp.resolved.as_deref() == Some(&def_file.path));
+                    if is_imported {
+                        matched_files.insert(&def_file.path);
+                    }
+                }
+                for def_path in matched_files {
+                    *edge_counts
+                        .entry((file.path.clone(), def_path.to_string()))
+                        .or_default() += 1;
+                }
+            } else {
+                // 2. Free function `nombre(` or qualified `Tipo::nombre(`
+                // If defined locally in the same file, this is an intra-file call (ignore self-call)
+                let local_def = all_defs.iter().any(|(def_file, sym)| {
+                    def_file.path == file.path && sym.parent.as_ref() == call.qualifier.as_ref()
+                });
+                if local_def {
+                    continue;
+                }
+
+                let mut target_defs: Vec<(&FileEntry, &Symbol)> = all_defs
+                    .iter()
+                    .filter(|(def_file, _)| {
+                        def_file.path != file.path
+                            && file_families.get(def_file.path.as_str()) == Some(&caller_fam)
+                    })
+                    .copied()
+                    .collect();
+
+                if target_defs.is_empty() {
+                    continue;
+                }
+
+                // If call has a qualifier `Tipo::`, prefer definitions with parent == Tipo
+                if let Some(q) = &call.qualifier {
+                    let with_parent: Vec<(&FileEntry, &Symbol)> = target_defs
+                        .iter()
+                        .filter(|(_, s)| s.parent.as_deref() == Some(q.as_str()))
+                        .copied()
+                        .collect();
+                    if !with_parent.is_empty() {
+                        target_defs = with_parent;
+                    }
+                }
+
+                let mut target_files: Vec<&FileEntry> = target_defs.into_iter().map(|(f, _)| f).collect();
+                target_files.sort_by_key(|f| &f.path);
+                target_files.dedup_by_key(|f| &f.path);
+
+                if target_files.len() == 1 {
+                    *edge_counts
+                        .entry((file.path.clone(), target_files[0].path.clone()))
+                        .or_default() += 1;
+                } else {
+                    // Between definitions of the same name, prefer imported files
+                    let imported: Vec<&FileEntry> = target_files
+                        .iter()
+                        .filter(|def| {
+                            file.imports
+                                .iter()
+                                .any(|imp| imp.resolved.as_deref() == Some(&def.path))
+                        })
+                        .copied()
+                        .collect();
+
+                    if !imported.is_empty() {
+                        for target in imported {
+                            *edge_counts
+                                .entry((file.path.clone(), target.path.clone()))
+                                .or_default() += 1;
+                        }
+                    } else {
+                        for target in target_files {
+                            *edge_counts
+                                .entry((file.path.clone(), target.path.clone()))
+                                .or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<(String, String, usize)> = edge_counts
+        .into_iter()
+        .map(|((from, to), count)| (from, to, count))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    out
 }
 
 /// Returns `(imports, imported_by)` for a given file.
@@ -731,13 +989,15 @@ pub fn neighbor_rules_for_file(
 }
 
 fn is_injectable_rule(node: &Node, score_opt: Option<&Score>) -> bool {
-    if node.has(flags::POTENTIAL) || node.has(flags::STALE) || node.has(flags::PROPOSED) {
+    if node.has(flags::POTENTIAL) || node.has(flags::STALE) {
         return false;
     }
     if let Some(score) = score_opt {
-        if !score.visible {
+        if !score.visible || !crate::hook::may_inject(node, score, None) {
             return false;
         }
+    } else if node.has(flags::PROPOSED) {
+        return false;
     }
     true
 }
@@ -889,6 +1149,8 @@ mod tests {
                     from: "run".to_string(),
                     name: "saturate".to_string(),
                     line: 15,
+                    has_receiver: false,
+                    qualifier: None,
                 }],
             }],
         };
@@ -940,11 +1202,7 @@ mod tests {
                     status: "-".to_string(),
             symbols: vec![],
             imports: vec![],
-            calls: vec![Call {
-                from: "handleClick".to_string(),
-                name: "save".to_string(),
-                line: 5,
-            }],
+            calls: vec![Call::new("handleClick", "save", 5)],
         });
         idx.files.push(FileEntry {
             path: "index.html".to_string(),
@@ -955,11 +1213,7 @@ mod tests {
                     status: "-".to_string(),
             symbols: vec![],
             imports: vec![],
-            calls: vec![Call {
-                from: "button#btn".to_string(),
-                name: "save".to_string(),
-                line: 10,
-            }],
+            calls: vec![Call::new("button#btn", "save", 10)],
         });
 
         // Python save has NO callers from JS or HTML because they are in different language families
@@ -1046,11 +1300,7 @@ mod tests {
                 raw: "use crate::f1::common;".to_string(),
                 resolved: Some("src/f1.rs".to_string()),
             }],
-            calls: vec![Call {
-                from: "caller".to_string(),
-                name: "common".to_string(),
-                line: 3,
-            }],
+            calls: vec![Call::new("caller", "common", 3)],
         });
 
         let res = callers(&index, "common");
@@ -1359,6 +1609,376 @@ use super::model::*;
         assert_eq!(map_new.siblings[0].public_symbols[0].name, "parse");
         assert_eq!(map_new.siblings[1].path, "src/main.rs");
         assert_eq!(map_new.siblings[1].public_symbols[0].name, "main");
+    }
+
+
+    #[test]
+    fn test_call_edges_resolution_and_aggregation() {
+        let mut idx = ProjectIndex::default();
+
+        // 1. Target files defining symbols
+        idx.files.push(FileEntry {
+            path: "src/util.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 100,
+            mtime: 1,
+            hash: 1,
+            status: "-".to_string(),
+            symbols: vec![
+                Symbol {
+                    name: "helper".to_string(),
+                    kind: "fn".to_string(),
+                    line: 1,
+                    end_line: 5,
+                    public: true,
+                    parent: None,
+                    test: false,
+                    signature: "()".to_string(),
+                    decorators: vec![],
+                },
+                Symbol {
+                    name: "ambiguous_sym".to_string(),
+                    kind: "fn".to_string(),
+                    line: 6,
+                    end_line: 10,
+                    public: true,
+                    parent: None,
+                    test: false,
+                    signature: "()".to_string(),
+                    decorators: vec![],
+                },
+            ],
+            imports: vec![],
+            calls: vec![],
+        });
+
+        // 2. Caller file in Rust
+        idx.files.push(FileEntry {
+            path: "src/main.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 200,
+            mtime: 2,
+            hash: 2,
+            status: "-".to_string(),
+            symbols: vec![
+                Symbol {
+                    name: "run".to_string(),
+                    kind: "fn".to_string(),
+                    line: 1,
+                    end_line: 10,
+                    public: true,
+                    parent: None,
+                    test: false,
+                    signature: "()".to_string(),
+                    decorators: vec![],
+                },
+                Symbol {
+                    name: "test_run".to_string(),
+                    kind: "fn".to_string(),
+                    line: 11,
+                    end_line: 15,
+                    public: false,
+                    parent: None,
+                    test: true,
+                    signature: "()".to_string(),
+                    decorators: vec![],
+                },
+            ],
+            imports: vec![Import {
+                raw: "crate::util".to_string(),
+                resolved: Some("src/util.rs".to_string()),
+            }],
+            calls: vec![
+                Call::new("run", "helper", 3),
+                Call::new("run", "helper", 4),
+                // Call from test function -> must be ignored
+                Call::new("test_run", "helper", 12),
+                // Call to self (run calling run) -> must be ignored
+                Call::new("run", "run", 5),
+                // Call to ambiguous symbol defined in 4 files -> must be ignored
+                Call::new("run", "ambiguous_sym", 6),
+            ],
+        });
+
+        // Files 3, 4, 5 defining ambiguous_sym to make it defined in 4 files (> 3)
+        for i in 1..=3 {
+            idx.files.push(FileEntry {
+                path: format!("src/ambig_{i}.rs"),
+                lang: "rust".to_string(),
+                size: 50,
+                mtime: 3,
+                hash: 3,
+                status: "-".to_string(),
+                symbols: vec![Symbol {
+                    name: "ambiguous_sym".to_string(),
+                    kind: "fn".to_string(),
+                    line: 1,
+                    end_line: 5,
+                    public: true,
+                    parent: None,
+                    test: false,
+                    signature: "()".to_string(),
+                    decorators: vec![],
+                }],
+                imports: vec![],
+                calls: vec![],
+            });
+        }
+
+        // Python file calling 'helper' -> different family (Python vs Rust), must NOT link to src/util.rs
+        idx.files.push(FileEntry {
+            path: "scripts/tool.py".to_string(),
+            lang: "python".to_string(),
+            size: 80,
+            mtime: 4,
+            hash: 4,
+            status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![],
+            calls: vec![Call::new("main", "helper", 2)],
+        });
+
+        let edges = call_edges(&idx);
+        // Only src/main.rs -> src/util.rs with count 2 should be present!
+        assert_eq!(edges, vec![("src/main.rs".to_string(), "src/util.rs".to_string(), 2)]);
+    }
+
+    #[test]
+    fn test_callers_hashmap_get_does_not_link() {
+        let mut idx = ProjectIndex::default();
+        // Target file defining Args::get
+        idx.files.push(FileEntry {
+            path: "src/args.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 100,
+            mtime: 1,
+            hash: 1,
+            status: "-".to_string(),
+            symbols: vec![Symbol {
+                name: "get".to_string(),
+                kind: "fn".to_string(),
+                line: 10,
+                end_line: 20,
+                public: true,
+                parent: Some("Args".to_string()),
+                test: false,
+                signature: "(&self, key: &str) -> Option<&str>".to_string(),
+                decorators: vec![],
+            }],
+            imports: vec![],
+            calls: vec![],
+        });
+
+        // Caller file calling .get("key") on a HashMap (has receiver, no qualifier)
+        idx.files.push(FileEntry {
+            path: "src/main.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 100,
+            mtime: 1,
+            hash: 2,
+            status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![Import {
+                raw: "use crate::args::Args;".to_string(),
+                resolved: Some("src/args.rs".to_string()),
+            }],
+            calls: vec![Call {
+                from: "run".to_string(),
+                name: "get".to_string(),
+                line: 15,
+                has_receiver: true,
+                qualifier: None,
+            }],
+        });
+
+        let res = callers(&idx, "get");
+        assert_eq!(res.callers.len(), 0, ".get on HashMap must never link to repo's get");
+        assert_eq!(res.posibles.len(), 0, "stdlib blacklist must not be in posibles");
+        let edges = call_edges(&idx);
+        assert_eq!(edges.len(), 0, ".get on HashMap must not create call edges");
+    }
+
+    #[test]
+    fn test_callers_v_parse_does_not_link() {
+        let mut idx = ProjectIndex::default();
+        idx.files.push(FileEntry {
+            path: "src/parser.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 100,
+            mtime: 1,
+            hash: 1,
+            status: "-".to_string(),
+            symbols: vec![Symbol {
+                name: "parse".to_string(),
+                kind: "fn".to_string(),
+                line: 5,
+                end_line: 15,
+                public: true,
+                parent: Some("Parser".to_string()),
+                test: false,
+                signature: "(&self) -> bool".to_string(),
+                decorators: vec![],
+            }],
+            imports: vec![],
+            calls: vec![],
+        });
+
+        idx.files.push(FileEntry {
+            path: "src/main.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 100,
+            mtime: 1,
+            hash: 2,
+            status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![Import {
+                raw: "use crate::parser::Parser;".to_string(),
+                resolved: Some("src/parser.rs".to_string()),
+            }],
+            calls: vec![Call {
+                from: "run".to_string(),
+                name: "parse".to_string(),
+                line: 25,
+                has_receiver: true,
+                qualifier: None,
+            }],
+        });
+
+        let res = callers(&idx, "parse");
+        assert_eq!(res.callers.len(), 0, "v.parse() must never link");
+        let edges = call_edges(&idx);
+        assert_eq!(edges.len(), 0, "v.parse() must not create call edges");
+    }
+
+    #[test]
+    fn test_callers_imported_method_links() {
+        let mut idx = ProjectIndex::default();
+        // File defining Worker::process
+        idx.files.push(FileEntry {
+            path: "src/worker.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 100,
+            mtime: 1,
+            hash: 1,
+            status: "-".to_string(),
+            symbols: vec![Symbol {
+                name: "process".to_string(),
+                kind: "fn".to_string(),
+                line: 10,
+                end_line: 20,
+                public: true,
+                parent: Some("Worker".to_string()),
+                test: false,
+                signature: "(&self)".to_string(),
+                decorators: vec![],
+            }],
+            imports: vec![],
+            calls: vec![],
+        });
+
+        // File A imports worker.rs and calls w.process()
+        idx.files.push(FileEntry {
+            path: "src/importer.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 100,
+            mtime: 1,
+            hash: 2,
+            status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![Import {
+                raw: "use crate::worker::Worker;".to_string(),
+                resolved: Some("src/worker.rs".to_string()),
+            }],
+            calls: vec![Call {
+                from: "do_job".to_string(),
+                name: "process".to_string(),
+                line: 5,
+                has_receiver: true,
+                qualifier: None,
+            }],
+        });
+
+        // File B does NOT import worker.rs but calls x.process()
+        idx.files.push(FileEntry {
+            path: "src/other.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 100,
+            mtime: 1,
+            hash: 3,
+            status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![],
+            calls: vec![Call {
+                from: "other_job".to_string(),
+                name: "process".to_string(),
+                line: 8,
+                has_receiver: true,
+                qualifier: None,
+            }],
+        });
+
+        let res = callers(&idx, "process");
+        assert_eq!(res.callers.len(), 1, "Importing file MUST link");
+        assert_eq!(res.callers[0].path, "src/importer.rs");
+        assert_eq!(res.posibles.len(), 1, "Non-importing file must be in posibles");
+        assert_eq!(res.posibles[0].path, "src/other.rs");
+
+        let edges = call_edges(&idx);
+        assert_eq!(edges, vec![("src/importer.rs".to_string(), "src/worker.rs".to_string(), 1)]);
+    }
+
+    #[test]
+    fn test_callers_type_qualified_method_links() {
+        let mut idx = ProjectIndex::default();
+        idx.files.push(FileEntry {
+            path: "src/tipo.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 100,
+            mtime: 1,
+            hash: 1,
+            status: "-".to_string(),
+            symbols: vec![Symbol {
+                name: "metodo".to_string(),
+                kind: "fn".to_string(),
+                line: 10,
+                end_line: 20,
+                public: true,
+                parent: Some("Tipo".to_string()),
+                test: false,
+                signature: "()".to_string(),
+                decorators: vec![],
+            }],
+            imports: vec![],
+            calls: vec![],
+        });
+
+        idx.files.push(FileEntry {
+            path: "src/main.rs".to_string(),
+            lang: "rust".to_string(),
+            size: 100,
+            mtime: 1,
+            hash: 2,
+            status: "-".to_string(),
+            symbols: vec![],
+            imports: vec![Import {
+                raw: "use crate::tipo::Tipo;".to_string(),
+                resolved: Some("src/tipo.rs".to_string()),
+            }],
+            calls: vec![Call {
+                from: "run".to_string(),
+                name: "metodo".to_string(),
+                line: 12,
+                has_receiver: false,
+                qualifier: Some("Tipo".to_string()),
+            }],
+        });
+
+        let res = callers(&idx, "Tipo::metodo");
+        assert_eq!(res.callers.len(), 1, "Tipo::metodo must link");
+        assert_eq!(res.callers[0].path, "src/main.rs");
+
+        let edges = call_edges(&idx);
+        assert_eq!(edges, vec![("src/main.rs".to_string(), "src/tipo.rs".to_string(), 1)]);
     }
 
 }
